@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- https://phpunit.readthedocs.io/en/latest/configuration.html -->
+<phpunit
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/10.2/phpunit.xsd"
+        backupGlobals="false"
+        colors="true"
+        cacheResult="true"
+        cacheDirectory="var/cache/phpunit"
+        bootstrap="tests/bootstrap.php"
+        displayDetailsOnTestsThatTriggerDeprecations="true"
+        displayDetailsOnTestsThatTriggerErrors="true"
+        displayDetailsOnTestsThatTriggerNotices="true"
+        displayDetailsOnTestsThatTriggerWarnings="true"
+        displayDetailsOnPhpunitDeprecations="true"
+>
+    <php>
+        <ini name="error_reporting" value="-1"/>
+        <server name="APP_ENV" value="test" force="true"/>
+        <server name="SHELL_VERBOSITY" value="-1"/>
+    </php>
+    <testsuites>
+        <testsuite name="{COMPONENT_NAME} Test Suite">
+            <directory>tests</directory>
+        </testsuite>
+    </testsuites>
+    <coverage/>
+    <source>
+        <include>
+            <directory suffix=".php">src</directory>
+        </include>
+    </source>
+</phpunit>
