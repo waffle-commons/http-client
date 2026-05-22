@@ -120,6 +120,19 @@ final class ClientTest extends AbstractTestCase
         self::assertFalse($this->capturedOptions[CURLOPT_HEADER]);
     }
 
+    public function testProtocolAllowlistRestrictedToHttpAndHttps(): void
+    {
+        // SEC-03: cURL must refuse non-http(s) schemes even for redirects, blocking
+        // SSRF pivots via file://, gopher://, dict://, ldap://, etc.
+        $this->primeSuccessfulExchange(["HTTP/1.1 200 OK\r\n", "\r\n"], []);
+
+        $this->dispatch($this->psr17->createRequest('GET', 'https://example.com/'));
+
+        $expected = CURLPROTO_HTTP | CURLPROTO_HTTPS;
+        self::assertSame($expected, $this->capturedOptions[CURLOPT_PROTOCOLS]);
+        self::assertSame($expected, $this->capturedOptions[CURLOPT_REDIR_PROTOCOLS]);
+    }
+
     public function testHttp2ProtocolVersionIsApplied(): void
     {
         $this->primeSuccessfulExchange(["HTTP/2 200 \r\n", "\r\n"], []);

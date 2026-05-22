@@ -100,6 +100,12 @@ final readonly class Client implements ClientInterface
             CURLOPT_NOSIGNAL => true,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
+            // SEC-03: hard-restrict scheme to http(s). Blocks SSRF pivots via
+            // file://, gopher://, dict://, ldap://, etc., even when a caller-
+            // supplied URL or a server-supplied Location header tries to switch
+            // protocols mid-flight.
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_RETURNTRANSFER => false,
             CURLOPT_HEADER => false,
