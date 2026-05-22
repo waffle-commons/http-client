@@ -2,7 +2,7 @@
 <img src="./images/waffle-commons_logo.png" alt="Logo Waffles Commons" style="width: 25%;" /><br />
 This repository serves as a standardized template for creating new components within the Waffle Commons ecosystem. It provides a consistent structure, tooling configuration (Composer, PHPUnit, Mago, Psalm), and CI/CD pipeline (GitHub Actions) to accelerate development and maintain quality across all packages.
 
-**Note:** Replace `YOUR_CODECOV_TOKEN_HERE` in the Codecov badge URL if you integrate Codecov. Also, replace `{COMPONENT_NAME}` placeholders in badges after running the configuration script or manually.
+**Note:** Replace `YOUR_CODECOV_TOKEN_HERE` in the Codecov badge URL if you integrate Codecov. Also, replace `HttpClient` placeholders in badges after running the configuration script or manually.
 
 ## Purpose
 Using this template ensures that new components adhere to the established standards of the Waffle Commons project regarding:
@@ -21,7 +21,7 @@ Follow these steps precisely to create a new Waffle Commons component:
 Use this template to create a new `waffle-commons` repository.
 
 ### 2. **Run the Configuration Script:**
-Execute the provided configuration script, passing the PascalCase component name as the first and only argument. This script will automatically replace the placeholder {COMPONENT_NAME} in file contents, filenames, and directory names.
+Execute the provided configuration script, passing the PascalCase component name as the first and only argument. This script will automatically replace the placeholder HttpClient in file contents, filenames, and directory names.
 ```shell
 # Example for 'Http' component
 ./configure-component.sh Http

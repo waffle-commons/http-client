@@ -20,7 +20,7 @@
         <server name="SHELL_VERBOSITY" value="-1"/>
     </php>
     <testsuites>
-        <testsuite name="{COMPONENT_NAME} Test Suite">
+        <testsuite name="HttpClient Test Suite">
             <directory>tests</directory>
         </testsuite>
     </testsuites>
