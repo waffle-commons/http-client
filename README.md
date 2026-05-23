@@ -1,91 +1,88 @@
-# Waffle Commons - Component Template
-<img src="./images/waffle-commons_logo.png" alt="Logo Waffles Commons" style="width: 25%;" /><br />
-This repository serves as a standardized template for creating new components within the Waffle Commons ecosystem. It provides a consistent structure, tooling configuration (Composer, PHPUnit, Mago, Psalm), and CI/CD pipeline (GitHub Actions) to accelerate development and maintain quality across all packages.
+[![PHP Version Require](http://poser.pugx.org/waffle-commons/http-client/require/php)](https://packagist.org/packages/waffle-commons/http-client)
+[![PHP CI](https://github.com/waffle-commons/http-client/actions/workflows/main.yml/badge.svg)](https://github.com/waffle-commons/http-client/actions/workflows/main.yml)
+[![codecov](https://codecov.io/gh/waffle-commons/http-client/graph/badge.svg)](https://codecov.io/gh/waffle-commons/http-client)
+[![Latest Stable Version](http://poser.pugx.org/waffle-commons/http-client/v)](https://packagist.org/packages/waffle-commons/http-client)
+[![Latest Unstable Version](http://poser.pugx.org/waffle-commons/http-client/v/unstable)](https://packagist.org/packages/waffle-commons/http-client)
+[![Total Downloads](https://img.shields.io/packagist/dt/waffle-commons/http-client.svg)](https://packagist.org/packages/waffle-commons/http-client)
+[![Packagist License](https://img.shields.io/packagist/l/waffle-commons/http-client)](https://github.com/waffle-commons/http-client/blob/main/LICENSE.md)
 
-**Note:** Replace `YOUR_CODECOV_TOKEN_HERE` in the Codecov badge URL if you integrate Codecov. Also, replace `HttpClient` placeholders in badges after running the configuration script or manually.
+Waffle HTTP Client Component
+============================
 
-## Purpose
-Using this template ensures that new components adhere to the established standards of the Waffle Commons project regarding:
-- **Directory Structure:** Standard `src/`, `tests/`, etc.
-- **Coding Standards:** Enforced via Mago (formatter, linter, analyzer) with pre-configured rules.
-- **Testing:** Setup for PHPUnit, including configuration (`phpunit.xml`), bootstrap, and coverage reporting.
-- **Static Analysis:** Configured for Psalm and Mago Analyze. 
-- **Automation:** Pre-configured GitHub Actions workflow for CI, mirroring the core framework's quality checks. 
-- **Documentation:** Standard files like this `CONTRIBUTING.md`, `LICENSE.md`, issue templates, etc. 
-- **Composer Setup:** Pre-filled `composer.json` with necessary scripts and development dependencies.
+> **Release:** `v0.1.0-beta1`
+> **PSR Compliance:** PSR-18 (`Psr\Http\Client\ClientInterface`), PSR-7 messages, PSR-17 factories
 
-## How to Use This Template
-Follow these steps precisely to create a new Waffle Commons component:
+A high-performance PSR-18 HTTP client tuned for FrankenPHP resident-worker proxying. Holds a single persistent `\CurlHandle` reused via `curl_reset()` across every `sendRequest()` so libcurl's DNS cache and keep-alive pool stay warm. Response bodies are streamed in 8 KiB chunks directly into a PSR-7 stream backed by `php://temp`; the full body is never materialised as a string.
 
-### 1. **Clone the Template:**
-Use this template to create a new `waffle-commons` repository.
+## 🆕 Beta-1 highlight — SEC-03 SSRF allowlist
 
-### 2. **Run the Configuration Script:**
-Execute the provided configuration script, passing the PascalCase component name as the first and only argument. This script will automatically replace the placeholder HttpClient in file contents, filenames, and directory names.
-```shell
-# Example for 'Http' component
-./configure-component.sh Http
+`Client::applyRequest()` now sets both `CURLOPT_PROTOCOLS` and `CURLOPT_REDIR_PROTOCOLS` to `CURLPROTO_HTTP | CURLPROTO_HTTPS`. This blocks SSRF pivots via `file://`, `gopher://`, `dict://`, `ldap://`, etc. — even when a caller-supplied URL or a server-supplied `Location` header tries to switch protocols mid-flight.
+
+## 📦 Installation
+
+```bash
+composer require waffle-commons/http-client
 ```
-- Carefully review the output of the script to ensure all replacements and renames were successful.
 
-### 3. **Review and Finalize `composer.json`:**
-- Open composer.json.
-- Verify the `"name"` is correct (e.g., `waffle-commons/http`). It should have been updated by the script.
-- Crucially, update the `"description"` field to accurately describe your new component's purpose. 
-- Add any specific `require` dependencies needed for this component (e.g., `psr/http-message` for the `http` component).
-- Add specific `require-dev` dependencies if needed beyond the standard template (e.g., `php-mock/php-mock-phpunit` was included, but others might be needed).
-- Verify the PSR-4 namespaces in `autoload` and `autoload-dev` were correctly updated by the script.
+You also need PSR-17 factory implementations for `ResponseFactoryInterface` and `StreamFactoryInterface`. The framework defaults to `waffle-commons/http`; `nyholm/psr7` works equally well.
 
-### 4. **Updates in various files:**
-- Edit this `README.md` file to describe the component.
-- Edit `.github/workflows/main.yml` to activate it.
+## 🧱 Surface
 
-### 5. **Configure GitHub Repository Settings:**
-- **Branch Protection:** Set up branch protection rules for `main` (require status checks to pass, require PR reviews, etc.).
-- **Secrets:** Add necessary secrets (e.g., `CODECOV_TOKEN`) if applicable for CI workflows.
-- **Labels:** Ensure standard labels (`bug`, `enhancement`, `good first issue`, etc.) are created (consider copying from `waffle-commons/waffle`).
-- **Discussions:** Enable GitHub Discussions if desired for the component.
-- **Issue:** Create customized template for **Bug report** (`.github/ISSUE_TEMPLATE/bug-report.md`) and  **Feature request** (`.github/ISSUE_TEMPLATE/feature-request.md`)
-- **Pull request:** Ensure standard pull requests respect the template (`.github/PULL_REQUEST_TEMPLATE.md`)
+| Class | Role |
+| :--- | :--- |
+| `Waffle\Commons\HttpClient\Client` | `final readonly` PSR-18 client. Persistent cURL handle, hardcoded 1s connect / 10s total timeouts, body streamed in 8 KiB chunks. |
+| `Waffle\Commons\HttpClient\Exception\HttpClientException` | Base class for client errors (e.g. handle init failure). Implements `Psr\Http\Client\ClientExceptionInterface`. |
+| `Waffle\Commons\HttpClient\Exception\NetworkException` | Transport-layer failures (DNS, connect/read timeout, TLS, reset). Implements `Psr\Http\Client\NetworkExceptionInterface`. |
+| `Waffle\Commons\HttpClient\Exception\RequestException` | Protocol-level failures or empty responses. Implements `Psr\Http\Client\RequestExceptionInterface`. |
 
-### 6. **Start Developing!**
-You can now start writing your component's code in the `src/` directory and corresponding tests in the `tests/` directory. Remember to follow the established coding standards.
+## 🚀 Usage
 
-## Development Tooling (Composer Scripts)
-This template comes with pre-configured Composer scripts for common development tasks. Run these from the root of your new component's directory:
-- **Install Dependencies:**
-    ```shell
-    composer install
-    ```
-- **Run Tests (PHPUnit):** Generates coverage reports in `var/data/phpunit-coverage/`.
-    ```shell
-    composer tests
-    ```
-- **Run Mago (Format Check, Lint, Analyze):**
-    ```shell
-    composer mago
-    ```
-    - Check Formatting Only: `composer formatter --check`
-    - Apply Formatting: `composer formatter` 
-    - Run Linter: `composer linter`
-    - Run Analyzer: `composer analyzer`
-- **Run Psalm-Taint Analysis:**
-    ```shell
-    vendor/bin/psalm --taint-analysis
-    ```
-- **Check for Dependency Vulnerabilities:**
-    ```shell
-    composer audit
-    ```
-- **Run All CI Checks Locally:** Simulates the checks run in GitHub Actions (without security checks).
-    ```shell
-    composer ci
-    ```
+```php
+use Nyholm\Psr7\Factory\Psr17Factory;
+use Waffle\Commons\HttpClient\Client;
 
-## Contributing
-While this repository is a template, contributions to the template itself (improving tooling, structure, CI) are welcome via Pull Requests to the `waffle-commons/component-template` repository.
+$psr17 = new Psr17Factory();
+$client = new Client(
+    responseFactory: $psr17,
+    streamFactory:   $psr17,
+);
 
-For contributions to components created from this template, please refer to the main and the specific `CONTRIBUTING.md` within that component's repository.
+$request = $psr17->createRequest('GET', 'https://api.example.com/users');
+$response = $client->sendRequest($request);
 
-## License
-This template, and components created from it by default, are licensed under the MIT License. See the file for details.
+echo $response->getStatusCode();             // 200
+echo (string) $response->getBody();          // streamed body
+```
+
+## 🛡️ Security defaults
+
+The client enforces a minimum security baseline that callers cannot lower:
+
+| Option | Value | Why |
+| :--- | :--- | :--- |
+| `CURLOPT_PROTOCOLS` | `CURLPROTO_HTTP \| CURLPROTO_HTTPS` | SEC-03 SSRF allowlist on the request URL. |
+| `CURLOPT_REDIR_PROTOCOLS` | `CURLPROTO_HTTP \| CURLPROTO_HTTPS` | SEC-03 SSRF allowlist on any redirect target. |
+| `CURLOPT_SSL_VERIFYPEER` | `true` | Forces full certificate validation. |
+| `CURLOPT_SSL_VERIFYHOST` | `2` | Forces hostname match against the certificate. |
+| `CURLOPT_FOLLOWLOCATION` | `false` | The client never silently follows redirects — callers must handle them explicitly. |
+| `CURLOPT_CONNECTTIMEOUT_MS` | `1_000` | Hard 1-second ceiling. Cannot be raised. |
+| `CURLOPT_TIMEOUT_MS` | `10_000` | Hard 10-second ceiling. Cannot be raised. A hung legacy backend must never lock a worker thread. |
+
+## 🐘 PHP 8.5 features used
+
+- **`final readonly class Client`** with promoted constructor properties.
+- **Typed integer constants** for every timeout/chunk-size value (`CONNECT_TIMEOUT_MS`, `TIMEOUT_MS`, `CHUNK_SIZE`).
+- **`#[\Override]`** on the PSR-18 implementation method.
+- **`match`** expression for HTTP-version negotiation.
+
+## 🧪 Testing
+
+```bash
+docker exec -w /waffle-commons/http-client waffle-dev composer tests
+```
+
+The test suite uses `php-mock/php-mock-phpunit` to stub libcurl entry points (`curl_init`, `curl_setopt_array`, `curl_exec`, …), so PHPUnit runs hermetically without network I/O. A dedicated test asserts the SEC-03 protocol allowlist is set on every request.
+
+## 📄 License
+
+MIT — see [LICENSE.md](./LICENSE.md).
