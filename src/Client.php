@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Waffle\Commons\HttpClient;
 
 use CurlHandle;
+use CurlMultiHandle;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseFactoryInterface;
@@ -18,10 +19,23 @@ use Waffle\Commons\HttpClient\Exception\RequestException;
 /**
  * High-performance PSR-18 HTTP client tuned for FrankenPHP resident-worker proxying.
  *
- * Holds a single persistent `\CurlHandle` that is reused — via `curl_reset()` —
- * across every `sendRequest()` call so libcurl's DNS cache and keep-alive pool
- * stay warm. Response bodies are streamed in 8 KiB chunks directly into a PSR-7
- * stream backed by `php://temp`; the full body is never materialised as a string.
+ * Holds a single persistent `\CurlHandle` plus a `\CurlMultiHandle` that are
+ * reused — via `curl_reset()` — across every `sendRequest()` call so libcurl's
+ * DNS cache and keep-alive pool stay warm.
+ *
+ * **Non-blocking transfer.** Rather than calling the blocking `curl_exec()`, the
+ * transfer is driven through the multi interface: the worker parks on
+ * `curl_multi_select()` (a socket-level wait) between `curl_multi_exec()` ticks
+ * instead of busy-spinning a CPU. The multi handle is the building block for
+ * future concurrent fan-out, and a slow legacy backend can no longer pin the
+ * worker on a blocking syscall beyond the hard timeout ceiling.
+ *
+ * **Bounded memory, both directions.** Response bodies are streamed in 8 KiB
+ * chunks into a PSR-7 stream via `CURLOPT_WRITEFUNCTION`; the full body is never
+ * materialised as a string. Request bodies are likewise *pulled* in 8 KiB chunks
+ * from the PSR-7 request stream via `CURLOPT_READFUNCTION` (`CURLOPT_UPLOAD`),
+ * so proxying a large multipart/chunked upload never buffers the whole payload
+ * in worker RAM.
  *
  * Connect and total timeouts are hardcoded ceilings (1s / 10s) and cannot be
  * raised by callers — a hung legacy backend must never lock a worker thread.
@@ -34,13 +48,18 @@ final readonly class Client implements ClientInterface
     /** Maximum total time for a single request, including transfer (ms). */
     public const int TIMEOUT_MS = 10_000;
 
-    /** Body streaming chunk size (bytes). */
+    /** Body streaming chunk size (bytes), used for both upload and download. */
     public const int CHUNK_SIZE = 8_192;
+
+    /** Upper bound (seconds) the worker parks on `curl_multi_select()` per tick. */
+    private const float SELECT_TIMEOUT = 1.0;
 
     private CurlHandle $handle;
 
+    private CurlMultiHandle $multiHandle;
+
     /**
-     * @throws HttpClientException If the underlying cURL handle cannot be allocated.
+     * @throws HttpClientException If the underlying cURL handle(s) cannot be allocated.
      */
     public function __construct(
         private ResponseFactoryInterface $responseFactory,
@@ -51,6 +70,8 @@ final readonly class Client implements ClientInterface
             throw new HttpClientException('Failed to initialise the underlying cURL handle.');
         }
         $this->handle = $handle;
+        // curl_multi_init() never fails (returns a CurlMultiHandle), so no guard.
+        $this->multiHandle = curl_multi_init();
     }
 
     /**
@@ -69,9 +90,9 @@ final readonly class Client implements ClientInterface
 
         $this->applyRequest($request, $body, $statusLine, $headers);
 
-        $ok = curl_exec($this->handle);
-        if ($ok === false) {
-            throw $this->mapCurlError($request, curl_errno($this->handle), curl_error($this->handle));
+        [$errno, $errorMessage] = $this->execute();
+        if ($errno !== CURLE_OK) {
+            throw $this->mapCurlError($request, $errno, $errorMessage);
         }
 
         if ($statusLine === '') {
@@ -79,6 +100,54 @@ final readonly class Client implements ClientInterface
         }
 
         return $this->buildResponse($statusLine, $headers, $body);
+    }
+
+    /**
+     * Drives the transfer through the persistent multi handle, parking on
+     * `curl_multi_select()` between ticks so the worker never busy-waits. The
+     * easy handle is added and removed each call but the underlying connection
+     * pool persists, so keep-alive survives across requests.
+     *
+     * @return array{0: int, 1: string} cURL error number (`CURLE_OK` on success) and message.
+     */
+    private function execute(): array
+    {
+        curl_multi_add_handle($this->multiHandle, $this->handle);
+
+        try {
+            $running = 0;
+            do {
+                $status = curl_multi_exec($this->multiHandle, $running);
+                if ($running > 0) {
+                    // Block on the socket set (or up to SELECT_TIMEOUT); never spin.
+                    curl_multi_select($this->multiHandle, self::SELECT_TIMEOUT);
+                }
+            } while ($running > 0 && $status === CURLM_OK);
+
+            if ($status !== CURLM_OK) {
+                return [CURLE_RECV_ERROR, curl_multi_strerror($status) ?? 'cURL multi handle failure.'];
+            }
+
+            // Drain the message queue for this transfer's terminal result code.
+            $result = CURLE_OK;
+            // $queued is a mandatory by-ref out-param (remaining messages); we
+            // don't use it, and cURL's stub types it as mixed.
+            // @mago-ignore analysis:mixed-assignment
+            $queued = 0;
+            while (($info = curl_multi_info_read($this->multiHandle, $queued)) !== false) {
+                if ($info['msg'] === CURLMSG_DONE) {
+                    $result = (int) $info['result'];
+                }
+            }
+
+            if ($result !== CURLE_OK) {
+                return [$result, curl_error($this->handle)];
+            }
+
+            return [CURLE_OK, ''];
+        } finally {
+            curl_multi_remove_handle($this->multiHandle, $this->handle);
+        }
     }
 
     /**
@@ -121,9 +190,54 @@ final readonly class Client implements ClientInterface
             },
         ]);
 
-        $payload = (string) $request->getBody();
-        if ($payload !== '') {
-            curl_setopt($this->handle, CURLOPT_POSTFIELDS, $payload);
+        $this->applyRequestBody($request);
+    }
+
+    /**
+     * Configures the request body as a *streamed* upload when one is present.
+     *
+     * libcurl pulls the body in `CHUNK_SIZE` increments through the read
+     * callback, so a large multipart/chunked payload is forwarded without ever
+     * being buffered whole in worker memory — unlike `CURLOPT_POSTFIELDS`, which
+     * requires the entire body as a single string. The request method set via
+     * `CURLOPT_CUSTOMREQUEST` is preserved; `CURLOPT_UPLOAD` only switches on the
+     * read-callback transfer mode, it does not override the method line.
+     *
+     * When the body length is known it is advertised via `CURLOPT_INFILESIZE`
+     * (Content-Length); when it is not (`getSize() === null`), libcurl falls back
+     * to `Transfer-Encoding: chunked`.
+     */
+    private function applyRequestBody(RequestInterface $request): void
+    {
+        $stream = $request->getBody();
+        $size = $stream->getSize();
+
+        // No body to forward (typical GET/DELETE/HEAD): leave the handle as-is.
+        if ($size === 0) {
+            return;
+        }
+
+        if ($stream->isSeekable()) {
+            $stream->rewind();
+        }
+
+        curl_setopt($this->handle, CURLOPT_UPLOAD, true);
+        curl_setopt(
+            $this->handle,
+            CURLOPT_READFUNCTION,
+            /**
+             * @param resource $_stream
+             */
+            static function (CurlHandle $_handle, $_stream, int $length) use ($stream): string {
+                if ($stream->eof()) {
+                    return '';
+                }
+                return $stream->read($length);
+            },
+        );
+
+        if ($size !== null) {
+            curl_setopt($this->handle, CURLOPT_INFILESIZE, $size);
         }
     }
 

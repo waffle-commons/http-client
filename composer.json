@@ -1,6 +1,5 @@
 {
     "name": "waffle-commons/http-client",
-    "version": "0.1.0-beta0",
     "description": "HTTP Client component for Waffle framework.",
     "type": "library",
     "license": "MIT",

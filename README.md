@@ -12,11 +12,13 @@ Waffle HTTP Client Component
 > **Release:** `v0.1.0-beta1`
 > **PSR Compliance:** PSR-18 (`Psr\Http\Client\ClientInterface`), PSR-7 messages, PSR-17 factories
 
-A high-performance PSR-18 HTTP client tuned for FrankenPHP resident-worker proxying. Holds a single persistent `\CurlHandle` reused via `curl_reset()` across every `sendRequest()` so libcurl's DNS cache and keep-alive pool stay warm. Response bodies are streamed in 8 KiB chunks directly into a PSR-7 stream backed by `php://temp`; the full body is never materialised as a string.
+A high-performance PSR-18 HTTP client tuned for FrankenPHP resident-worker proxying. Holds a single persistent `\CurlHandle` **plus** a `\CurlMultiHandle`, reused via `curl_reset()` across every `sendRequest()` so libcurl's DNS cache and keep-alive pool stay warm. The transfer is driven through the multi interface, so the worker parks on `curl_multi_select()` (a socket-level wait) instead of blocking inside `curl_exec()`. Bodies stream in 8 KiB chunks **in both directions** — request bodies are *pulled* from the PSR-7 request stream and response bodies are *pushed* into a PSR-7 stream — so neither side is ever materialised whole in worker memory.
 
-## 🆕 Beta-1 highlight — SEC-03 SSRF allowlist
+## 🆕 Beta-1 highlights
 
-`Client::applyRequest()` now sets both `CURLOPT_PROTOCOLS` and `CURLOPT_REDIR_PROTOCOLS` to `CURLPROTO_HTTP | CURLPROTO_HTTPS`. This blocks SSRF pivots via `file://`, `gopher://`, `dict://`, `ldap://`, etc. — even when a caller-supplied URL or a server-supplied `Location` header tries to switch protocols mid-flight.
+- **Non-blocking transfer.** The transfer runs through a persistent `\CurlMultiHandle` (`curl_multi_exec` + `curl_multi_select`) rather than the blocking `curl_exec()`. The worker never busy-spins, and a slow legacy backend can no longer pin it on a blocking syscall beyond the hard timeout ceiling. The multi handle is also the building block for future concurrent fan-out.
+- **Bidirectional bounded streaming.** Request bodies are streamed via `CURLOPT_READFUNCTION` + `CURLOPT_UPLOAD` (pulling `CHUNK_SIZE` bytes at a time from the PSR-7 request stream) instead of buffering the whole payload with `CURLOPT_POSTFIELDS`. Known lengths are advertised with `CURLOPT_INFILESIZE`; unknown lengths fall back to `Transfer-Encoding: chunked`. Response bodies stream via `CURLOPT_WRITEFUNCTION`. A multi-gigabyte multipart upload is proxied without a RAM spike.
+- **SEC-03 SSRF allowlist.** `Client::applyRequest()` sets both `CURLOPT_PROTOCOLS` and `CURLOPT_REDIR_PROTOCOLS` to `CURLPROTO_HTTP | CURLPROTO_HTTPS`, blocking SSRF pivots via `file://`, `gopher://`, `dict://`, `ldap://`, etc. — even when a caller-supplied URL or a server-supplied `Location` header tries to switch protocols mid-flight.
 
 ## 📦 Installation
 
@@ -30,7 +32,7 @@ You also need PSR-17 factory implementations for `ResponseFactoryInterface` and 
 
 | Class | Role |
 | :--- | :--- |
-| `Waffle\Commons\HttpClient\Client` | `final readonly` PSR-18 client. Persistent cURL handle, hardcoded 1s connect / 10s total timeouts, body streamed in 8 KiB chunks. |
+| `Waffle\Commons\HttpClient\Client` | `final readonly` PSR-18 client. Persistent cURL easy + multi handles, non-blocking transfer, hardcoded 1s connect / 10s total timeouts, request **and** response bodies streamed in 8 KiB chunks. |
 | `Waffle\Commons\HttpClient\Exception\HttpClientException` | Base class for client errors (e.g. handle init failure). Implements `Psr\Http\Client\ClientExceptionInterface`. |
 | `Waffle\Commons\HttpClient\Exception\NetworkException` | Transport-layer failures (DNS, connect/read timeout, TLS, reset). Implements `Psr\Http\Client\NetworkExceptionInterface`. |
 | `Waffle\Commons\HttpClient\Exception\RequestException` | Protocol-level failures or empty responses. Implements `Psr\Http\Client\RequestExceptionInterface`. |
@@ -81,7 +83,7 @@ The client enforces a minimum security baseline that callers cannot lower:
 docker exec -w /waffle-commons/http-client waffle-dev composer tests
 ```
 
-The test suite uses `php-mock/php-mock-phpunit` to stub libcurl entry points (`curl_init`, `curl_setopt_array`, `curl_exec`, …), so PHPUnit runs hermetically without network I/O. A dedicated test asserts the SEC-03 protocol allowlist is set on every request.
+The test suite uses `php-mock/php-mock-phpunit` to stub libcurl entry points (`curl_init`, `curl_setopt_array`, `curl_multi_exec`, `curl_multi_info_read`, …), so PHPUnit runs hermetically without network I/O. Dedicated tests assert the SEC-03 protocol allowlist, the chunked request-body upload, and the non-blocking multi-handle transfer.
 
 ## 📄 License
 

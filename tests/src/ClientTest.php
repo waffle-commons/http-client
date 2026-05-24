@@ -6,11 +6,13 @@ namespace WaffleTests\Commons\HttpClient;
 
 use Closure;
 use CurlHandle;
+use CurlMultiHandle;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use phpmock\phpunit\PHPMock;
 use PHPUnit\Framework\Attributes\CoversClass;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
 use Waffle\Commons\HttpClient\Client;
 use Waffle\Commons\HttpClient\Exception\HttpClientException;
 use Waffle\Commons\HttpClient\Exception\NetworkException;
@@ -20,6 +22,8 @@ use Waffle\Commons\HttpClient\Exception\RequestException;
 final class ClientTest extends AbstractTestCase
 {
     use PHPMock;
+
+    private const string NS = 'Waffle\\Commons\\HttpClient';
 
     private Psr17Factory $psr17;
 
@@ -33,6 +37,14 @@ final class ClientTest extends AbstractTestCase
 
     private ?Closure $writeCallback = null;
 
+    private ?CurlHandle $capturedHandle = null;
+
+    /** Per-request `curl_multi_exec` tick counter (reset on each add_handle). */
+    private int $execStage = 0;
+
+    /** Whether the single CURLMSG_DONE message has been consumed this request. */
+    private bool $infoRead = false;
+
     #[\Override]
     protected function setUp(): void
     {
@@ -42,11 +54,14 @@ final class ClientTest extends AbstractTestCase
         $this->capturedScalarOptions = [];
         $this->headerCallback = null;
         $this->writeCallback = null;
+        $this->capturedHandle = null;
+        $this->execStage = 0;
+        $this->infoRead = false;
     }
 
     public function testConstructorThrowsWhenCurlInitFails(): void
     {
-        $init = $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_init');
+        $init = $this->getFunctionMock(self::NS, 'curl_init');
         $init->expects($this->once())->willReturn(false);
 
         $this->expectException(HttpClientException::class);
@@ -171,7 +186,7 @@ final class ClientTest extends AbstractTestCase
         self::assertContains('X-Trace: abc-123', $forwarded);
     }
 
-    public function testRequestBodyIsForwardedAsPostFields(): void
+    public function testRequestBodyIsStreamedWithKnownLength(): void
     {
         $payload = '{"order":42}';
         $this->primeSuccessfulExchange(["HTTP/1.1 201 Created\r\n", "\r\n"], []);
@@ -182,16 +197,50 @@ final class ClientTest extends AbstractTestCase
             ->withBody($this->psr17->createStream($payload));
         $this->dispatch($request);
 
-        self::assertSame($payload, $this->capturedScalarOptions[CURLOPT_POSTFIELDS] ?? null);
+        // Streamed upload — never buffered as a single POSTFIELDS string.
+        self::assertArrayNotHasKey(CURLOPT_POSTFIELDS, $this->capturedScalarOptions);
+        self::assertTrue($this->capturedScalarOptions[CURLOPT_UPLOAD] ?? null);
+        self::assertSame(strlen($payload), $this->capturedScalarOptions[CURLOPT_INFILESIZE] ?? null);
+
+        // The read callback pulls the body in chunks and signals EOF with ''.
+        $read = $this->capturedScalarOptions[CURLOPT_READFUNCTION] ?? null;
+        self::assertInstanceOf(Closure::class, $read);
+        $handle = $this->capturedHandle;
+        self::assertInstanceOf(CurlHandle::class, $handle);
+        self::assertSame($payload, $read($handle, null, Client::CHUNK_SIZE));
+        self::assertSame('', $read($handle, null, Client::CHUNK_SIZE));
+        self::assertSame('', $read($handle, null, Client::CHUNK_SIZE));
     }
 
-    public function testEmptyRequestBodyDoesNotSetPostFields(): void
+    public function testRequestBodyWithUnknownLengthUsesChunkedUpload(): void
+    {
+        $this->primeSuccessfulExchange(["HTTP/1.1 200 OK\r\n", "\r\n"], []);
+        $this->mockCurlSetoptCapturingOption();
+
+        // A non-seekable stream of unknown size — the gateway must NOT advertise a
+        // Content-Length; libcurl falls back to Transfer-Encoding: chunked.
+        $stream = $this->createMock(StreamInterface::class);
+        $stream->method('getSize')->willReturn(null);
+        $stream->method('isSeekable')->willReturn(false);
+        $stream->expects($this->never())->method('rewind');
+
+        $request = $this->psr17->createRequest('POST', 'https://example.com/upload')->withBody($stream);
+        $this->dispatch($request);
+
+        self::assertTrue($this->capturedScalarOptions[CURLOPT_UPLOAD] ?? null);
+        self::assertArrayNotHasKey(CURLOPT_INFILESIZE, $this->capturedScalarOptions);
+        self::assertArrayNotHasKey(CURLOPT_POSTFIELDS, $this->capturedScalarOptions);
+    }
+
+    public function testEmptyRequestBodyDoesNotStream(): void
     {
         $this->primeSuccessfulExchange(["HTTP/1.1 200 OK\r\n", "\r\n"], []);
         $this->mockCurlSetoptCapturingOption();
 
         $this->dispatch($this->psr17->createRequest('GET', 'https://example.com/'));
 
+        self::assertArrayNotHasKey(CURLOPT_UPLOAD, $this->capturedScalarOptions);
+        self::assertArrayNotHasKey(CURLOPT_READFUNCTION, $this->capturedScalarOptions);
         self::assertArrayNotHasKey(CURLOPT_POSTFIELDS, $this->capturedScalarOptions);
     }
 
@@ -212,17 +261,8 @@ final class ClientTest extends AbstractTestCase
 
     public function testNetworkErrorMapsToNetworkException(): void
     {
-        $this->mockCurlSetoptArrayCapturingOptions();
-        $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_reset')->expects($this->once());
-        $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_exec')->expects($this->once())->willReturn(false);
-        $this
-            ->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_errno')
-            ->expects($this->once())
-            ->willReturn(CURLE_OPERATION_TIMEOUTED);
-        $this
-            ->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_error')
-            ->expects($this->once())
-            ->willReturn('Operation timed out');
+        $this->mockTransfer([], [], CURLE_OPERATION_TIMEOUTED);
+        $this->getFunctionMock(self::NS, 'curl_error')->expects($this->any())->willReturn('Operation timed out');
 
         $client = new Client($this->psr17, $this->psr17);
         $request = $this->psr17->createRequest('GET', 'https://slow.example.com/');
@@ -239,14 +279,8 @@ final class ClientTest extends AbstractTestCase
 
     public function testRequestErrorMapsToRequestException(): void
     {
-        $this->mockCurlSetoptArrayCapturingOptions();
-        $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_reset')->expects($this->once());
-        $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_exec')->expects($this->once())->willReturn(false);
-        $this
-            ->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_errno')
-            ->expects($this->once())
-            ->willReturn(CURLE_URL_MALFORMAT);
-        $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_error')->expects($this->once())->willReturn('');
+        $this->mockTransfer([], [], CURLE_URL_MALFORMAT);
+        $this->getFunctionMock(self::NS, 'curl_error')->expects($this->any())->willReturn('');
 
         $client = new Client($this->psr17, $this->psr17);
         $request = $this->psr17->createRequest('GET', 'https://example.com/');
@@ -261,21 +295,45 @@ final class ClientTest extends AbstractTestCase
         }
     }
 
-    public function testPersistentHandleIsReusedAcrossRequests(): void
+    public function testMultiHandleFailureMapsToNetworkException(): void
     {
-        $init = $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_init');
-        $init->expects($this->once())->willReturnCallback(static fn(): CurlHandle|false => \curl_init());
-
-        $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_reset')->expects($this->exactly(2));
-
-        $this->mockCurlSetoptArrayCapturingOptions();
-        $this->primeCurlExec(["HTTP/1.1 200 OK\r\n", "\r\n"], []);
+        $this->mockTransfer(["HTTP/1.1 200 OK\r\n", "\r\n"], [], CURLE_OK, CURLM_INTERNAL_ERROR);
+        $this
+            ->getFunctionMock(self::NS, 'curl_multi_strerror')
+            ->expects($this->any())
+            ->willReturn('multi handle exploded');
 
         $client = new Client($this->psr17, $this->psr17);
         $request = $this->psr17->createRequest('GET', 'https://example.com/');
 
-        $client->sendRequest($request);
-        $client->sendRequest($request);
+        try {
+            $client->sendRequest($request);
+            self::fail('Expected NetworkException');
+        } catch (NetworkException $exception) {
+            self::assertSame(CURLE_RECV_ERROR, $exception->getCode());
+            self::assertStringContainsString('multi handle exploded', $exception->getMessage());
+        }
+    }
+
+    public function testPersistentHandleIsReusedAcrossRequests(): void
+    {
+        // curl_init() must run exactly once: the handle is allocated in the
+        // constructor and reused (via curl_reset) on every request, never
+        // recreated per call — that reuse is what keeps the keep-alive pool warm.
+        $init = $this->getFunctionMock(self::NS, 'curl_init');
+        $init->expects($this->once())->willReturnCallback(static fn(): CurlHandle|false => \curl_init());
+
+        $this->mockTransfer(["HTTP/1.1 200 OK\r\n", "\r\n"], []);
+
+        $client = new Client($this->psr17, $this->psr17);
+        $request = $this->psr17->createRequest('GET', 'https://example.com/');
+
+        $first = $client->sendRequest($request);
+        $second = $client->sendRequest($request);
+
+        // Two consecutive requests over the one persistent handle both succeed.
+        self::assertSame(200, $first->getStatusCode());
+        self::assertSame(200, $second->getStatusCode());
     }
 
     public function testHeaderLineWithoutColonIsIgnored(): void
@@ -324,21 +382,105 @@ final class ClientTest extends AbstractTestCase
      */
     private function primeSuccessfulExchange(array $headerLines, array $bodyChunks): void
     {
+        $this->mockTransfer($headerLines, $bodyChunks);
+    }
+
+    /**
+     * Wires the full `curl_multi_*` transfer surface so a `sendRequest()` call
+     * runs end-to-end without touching the network. The simulated transfer ticks
+     * twice (still-running → done) to exercise the `curl_multi_select()` branch.
+     *
+     * @param list<string> $headerLines
+     * @param list<string> $bodyChunks
+     * @param int          $result      Per-transfer terminal cURL result (CURLE_*).
+     * @param int          $multiStatus curl_multi_exec return status (CURLM_*).
+     */
+    private function mockTransfer(
+        array $headerLines,
+        array $bodyChunks,
+        int $result = CURLE_OK,
+        int $multiStatus = CURLM_OK,
+    ): void {
         $this->mockCurlSetoptArrayCapturingOptions();
-        $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_reset')->expects($this->any());
-        $this->primeCurlExec($headerLines, $bodyChunks);
+
+        $this
+            ->getFunctionMock(self::NS, 'curl_multi_add_handle')
+            ->expects($this->any())
+            ->willReturnCallback(function (CurlMultiHandle $_mh, CurlHandle $_h): int {
+                // add_handle runs exactly once per execute(); reset per-request state here.
+                $this->execStage = 0;
+                $this->infoRead = false;
+                return 0;
+            });
+
+        $this->getFunctionMock(self::NS, 'curl_multi_remove_handle')->expects($this->any())->willReturn(0);
+        $this->getFunctionMock(self::NS, 'curl_multi_select')->expects($this->any())->willReturn(1);
+
+        $this
+            ->getFunctionMock(self::NS, 'curl_multi_exec')
+            ->expects($this->any())
+            ->willReturnCallback(function (CurlMultiHandle $_mh, int &$running) use (
+                $headerLines,
+                $bodyChunks,
+                $multiStatus,
+            ): int {
+                if ($multiStatus !== CURLM_OK) {
+                    $running = 0;
+                    return $multiStatus;
+                }
+                if ($this->execStage === 0) {
+                    $this->execStage = 1;
+                    $this->fireTransferCallbacks($headerLines, $bodyChunks);
+                    $running = 1; // still running → forces a curl_multi_select() + a second tick
+                    return CURLM_OK;
+                }
+                $running = 0;
+                return CURLM_OK;
+            });
+
+        $this
+            ->getFunctionMock(self::NS, 'curl_multi_info_read')
+            ->expects($this->any())
+            ->willReturnCallback(function (CurlMultiHandle $_mh) use ($result): array|false {
+                if ($this->infoRead) {
+                    return false;
+                }
+                $this->infoRead = true;
+                return ['msg' => CURLMSG_DONE, 'result' => $result, 'handle' => $this->capturedHandle];
+            });
+    }
+
+    /**
+     * @param list<string> $headerLines
+     * @param list<string> $bodyChunks
+     */
+    private function fireTransferCallbacks(array $headerLines, array $bodyChunks): void
+    {
+        $headerFn = $this->headerCallback;
+        $writeFn = $this->writeCallback;
+        $handle = $this->capturedHandle;
+        if (!$headerFn instanceof Closure || !$writeFn instanceof Closure || !$handle instanceof CurlHandle) {
+            self::fail('cURL callbacks/handle were not captured during curl_setopt_array.');
+        }
+        foreach ($headerLines as $line) {
+            $headerFn($handle, $line);
+        }
+        foreach ($bodyChunks as $chunk) {
+            $writeFn($handle, $chunk);
+        }
     }
 
     private function mockCurlSetoptArrayCapturingOptions(): void
     {
-        $setoptArray = $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_setopt_array');
+        $setoptArray = $this->getFunctionMock(self::NS, 'curl_setopt_array');
         $setoptArray
             ->expects($this->any())
             ->willReturnCallback(
                 /**
                  * @param array<int, mixed> $options
                  */
-                function (CurlHandle $_h, array $options): bool {
+                function (CurlHandle $handle, array $options): bool {
+                    $this->capturedHandle = $handle;
                     foreach ($options as $option => $value) {
                         $this->capturedOptions[$option] = $value;
                     }
@@ -357,38 +499,12 @@ final class ClientTest extends AbstractTestCase
 
     private function mockCurlSetoptCapturingOption(): void
     {
-        $setopt = $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_setopt');
+        $setopt = $this->getFunctionMock(self::NS, 'curl_setopt');
         $setopt
             ->expects($this->any())
             ->willReturnCallback(function (CurlHandle $_h, int $option, mixed $value): bool {
                 $this->capturedScalarOptions[$option] = $value;
                 return true;
             });
-    }
-
-    /**
-     * @param list<string> $headerLines
-     * @param list<string> $bodyChunks
-     */
-    private function primeCurlExec(array $headerLines, array $bodyChunks): void
-    {
-        $exec = $this->getFunctionMock('Waffle\\Commons\\HttpClient', 'curl_exec');
-        $exec->expects($this->any())->willReturnCallback(function (CurlHandle $handle) use (
-            $headerLines,
-            $bodyChunks,
-        ): bool {
-            $headerFn = $this->headerCallback;
-            $writeFn = $this->writeCallback;
-            if (!$headerFn instanceof Closure || !$writeFn instanceof Closure) {
-                self::fail('cURL header/write callbacks were not captured during curl_setopt_array.');
-            }
-            foreach ($headerLines as $line) {
-                $headerFn($handle, $line);
-            }
-            foreach ($bodyChunks as $chunk) {
-                $writeFn($handle, $chunk);
-            }
-            return true;
-        });
     }
 }
