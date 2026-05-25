@@ -135,9 +135,11 @@ final readonly class Client implements ClientInterface
             // @mago-ignore analysis:mixed-assignment
             $queued = 0;
             while (($info = curl_multi_info_read($this->multiHandle, $queued)) !== false) {
-                if ($info['msg'] === CURLMSG_DONE) {
-                    $result = (int) $info['result'];
+                if ($info['msg'] !== CURLMSG_DONE) {
+                    continue;
                 }
+
+                $result = (int) $info['result'];
             }
 
             if ($result !== CURLE_OK) {
