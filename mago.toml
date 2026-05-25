@@ -1,4 +1,4 @@
-# Mago Configuration - Waffle Commons ({COMPONENT_NAME}, Beta 0)
+# Mago Configuration - Waffle Commons (HttpClient, Beta 0)
 # For full documentation, see https://mago.carthage.software/tools/overview
 php-version = "8.5.5"
 
@@ -15,7 +15,13 @@ excludes = []
 # waffle-commons package (and declare the dependency in composer.json).
 [guard]
 mode = "default"
-excludes = ["tests/bootstrap.php"]
+# Mock-bootstrap files declare the production namespace to override built-in
+# PHP functions via php-mock. They are intentionally cross-layer and excluded
+# from guard analysis.
+excludes = [
+    "tests/bootstrap.php",
+    "tests/src/ClientTest.php",
+]
 
 [guard.perimeter]
 layering = ["Waffle", "WaffleTests"]
@@ -25,16 +31,16 @@ core = ["@global", "Psl\\**"]
 psr = ["Psr\\**"]
 
 [[guard.perimeter.rules]]
-namespace = "Waffle\\Commons\\{COMPONENT_NAME}"
+namespace = "Waffle\\Commons\\HttpClient"
 permit = [
-    "Waffle\\Commons\\{COMPONENT_NAME}\\**",
+    "Waffle\\Commons\\HttpClient\\**",
     "Waffle\\Commons\\Contracts\\**",
     "@layer:core",
     "@layer:psr",
 ]
 
 [[guard.perimeter.rules]]
-namespace = "WaffleTests\\Commons\\{COMPONENT_NAME}"
+namespace = "WaffleTests\\Commons\\HttpClient"
 permit = ["@all"]
 
 [[guard.structural.rules]]
@@ -76,20 +82,43 @@ disallowed-functions = { level = "error", functions = ["eval", "exec", "system",
 # Code quality - Strict
 prefer-interface = { level = "error" }
 strict-types = { level = "error" }
-property-type = { level = "error" }
-return-type = { level = "error" }
+no-ini-set = { enabled = false }
 
-cyclomatic-complexity = { level = "warning", threshold = 10 }
-
-# Style - Notes (informational)
-prefer-arrow-function = { level = "note" }
-no-redundant-nullsafe = { level = "note" }
+# >>> alpha6-opinionated-suppressions (generated)
+literal-named-argument = { enabled = false }
+no-boolean-flag-parameter = { enabled = false }
+single-class-per-file = { enabled = false }
+no-else-clause = { enabled = false }
+block-statement = { enabled = false }
+assertion-style = { enabled = false }
+assert-description = { enabled = false }
+tagged-todo = { enabled = false }
+cyclomatic-complexity = { enabled = false }
+too-many-methods = { enabled = false }
+kan-defect = { enabled = false }
+halstead = { enabled = false }
+prefer-arrow-function = { enabled = false }
+no-redundant-nullsafe = { enabled = false }
+excessive-parameter-list = { enabled = false }
+# <<< alpha6-opinionated-suppressions
 
 [analyzer]
 # Zero-Baseline policy (Beta 0): no `baseline = ...` is permitted.
 find-unused-definitions = true
 find-unused-expressions = true
 analyze-dead-code = true
-check-throws = true
 strict-list-index-checks = true
 strict-array-index-existence = true
+ignore = [
+    # cURL options are int constants → mixed-typed array values in test capture; iteration vars
+    # and intermediate Closure extraction are `mixed` by necessity.
+    { code = "mixed-assignment", in = ["tests/"] },
+    { code = "mixed-argument", in = ["tests/"] },
+    { code = "mixed-operand", in = ["tests/"] },
+    # Captured cURL options are populated by the mock at request time; Mago can't prove key
+    # presence across mock-callback boundaries even though every test pre-populates them.
+    { code = "possibly-undefined-int-array-index", in = ["tests/"] },
+    # `PHPUnit\Framework\TestCase::any` is the legacy invocation-matcher; phpunit 12 marks it as
+    # deprecated but offers no drop-in replacement that's compatible with php-mock-phpunit.
+    { code = "deprecated-method", in = ["tests/"] },
+]

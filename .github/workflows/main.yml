@@ -1,13 +1,12 @@
 name: Waffle Granular Pipeline
 
-on: workflow_dispatch
-# Uncomment this to activate the workflow on a new component
-#  push:
-#    branches:
-#      - main
-#    tags:
-#      - '*'
-#  pull_request:
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
 
 jobs:
   prepare:
@@ -243,4 +242,3 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./var/data/phpunit-coverage/clover.xml
-        if: matrix.php-version == '8.4'
