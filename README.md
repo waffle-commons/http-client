@@ -9,16 +9,21 @@
 Waffle HTTP Client Component
 ============================
 
-> **Release:** `v0.1.0-beta1`
+> **Release:** `v0.1.0-beta2` &nbsp;|&nbsp; [`CHANGELOG.md`](./CHANGELOG.md)
 > **PSR Compliance:** PSR-18 (`Psr\Http\Client\ClientInterface`), PSR-7 messages, PSR-17 factories
 
 A high-performance PSR-18 HTTP client tuned for FrankenPHP resident-worker proxying. Holds a single persistent `\CurlHandle` **plus** a `\CurlMultiHandle`, reused via `curl_reset()` across every `sendRequest()` so libcurl's DNS cache and keep-alive pool stay warm. The transfer is driven through the multi interface, so the worker parks on `curl_multi_select()` (a socket-level wait) instead of blocking inside `curl_exec()`. Bodies stream in 8 KiB chunks **in both directions** — request bodies are *pulled* from the PSR-7 request stream and response bodies are *pushed* into a PSR-7 stream — so neither side is ever materialised whole in worker memory.
 
-## 🆕 Beta-1 highlights
+## Beta-2 status
 
-- **Non-blocking transfer.** The transfer runs through a persistent `\CurlMultiHandle` (`curl_multi_exec` + `curl_multi_select`) rather than the blocking `curl_exec()`. The worker never busy-spins, and a slow legacy backend can no longer pin it on a blocking syscall beyond the hard timeout ceiling. The multi handle is also the building block for future concurrent fan-out.
-- **Bidirectional bounded streaming.** Request bodies are streamed via `CURLOPT_READFUNCTION` + `CURLOPT_UPLOAD` (pulling `CHUNK_SIZE` bytes at a time from the PSR-7 request stream) instead of buffering the whole payload with `CURLOPT_POSTFIELDS`. Known lengths are advertised with `CURLOPT_INFILESIZE`; unknown lengths fall back to `Transfer-Encoding: chunked`. Response bodies stream via `CURLOPT_WRITEFUNCTION`. A multi-gigabyte multipart upload is proxied without a RAM spike.
-- **SEC-03 SSRF allowlist.** `Client::applyRequest()` sets both `CURLOPT_PROTOCOLS` and `CURLOPT_REDIR_PROTOCOLS` to `CURLPROTO_HTTP | CURLPROTO_HTTPS`, blocking SSRF pivots via `file://`, `gopher://`, `dict://`, `ldap://`, etc. — even when a caller-supplied URL or a server-supplied `Location` header tries to switch protocols mid-flight.
+No behavioural changes since Beta-1 — lockstep version bump only. The client surface, security defaults, and streaming guarantees remain as described below.
+
+## 🆕 Beta-1 foundations (still current)
+
+- **Persistent socket reuse.** A single `\CurlHandle` and a single `\CurlMultiHandle` live for the worker's lifetime; `curl_reset()` between requests keeps the connection pool, DNS cache, and TLS session cache warm. Source: `Client.php` (`// Holds a single persistent CurlHandle plus a CurlMultiHandle that are reused via curl_reset() ...`).
+- **Non-blocking transfer.** The transfer runs through the persistent `\CurlMultiHandle` (`curl_multi_exec` + `curl_multi_select`) rather than the blocking `curl_exec()`. The worker never busy-spins, and a slow legacy backend can no longer pin it on a blocking syscall beyond the hard timeout ceiling. The multi handle is also the building block for future concurrent fan-out.
+- **Bidirectional bounded streaming (8 KiB chunks).** Request bodies are streamed via `CURLOPT_READFUNCTION` + `CURLOPT_UPLOAD` (pulling `CHUNK_SIZE = 8 * 1024` bytes at a time from the PSR-7 request stream) instead of buffering the whole payload with `CURLOPT_POSTFIELDS`. Known lengths are advertised with `CURLOPT_INFILESIZE`; unknown lengths fall back to `Transfer-Encoding: chunked`. Response bodies stream via `CURLOPT_WRITEFUNCTION`. A multi-gigabyte multipart upload is proxied without a RAM spike.
+- **SEC-03 SSRF allowlist.** `Client::applyRequest()` sets both `CURLOPT_PROTOCOLS` and `CURLOPT_REDIR_PROTOCOLS` to `CURLPROTO_HTTP | CURLPROTO_HTTPS` (verbatim, `Client.php:178-179`), blocking SSRF pivots via `file://`, `gopher://`, `dict://`, `ldap://`, etc. — even when a caller-supplied URL or a server-supplied `Location` header tries to switch protocols mid-flight.
 
 ## 📦 Installation
 
@@ -76,6 +81,21 @@ The client enforces a minimum security baseline that callers cannot lower:
 - **Typed integer constants** for every timeout/chunk-size value (`CONNECT_TIMEOUT_MS`, `TIMEOUT_MS`, `CHUNK_SIZE`).
 - **`#[\Override]`** on the PSR-18 implementation method.
 - **`match`** expression for HTTP-version negotiation.
+
+## 🧭 Architectural boundary (`mago guard`)
+
+An active dependency **perimeter** is enforced on every CI run by `vendor/bin/mago guard` (bundled into `composer mago`; zero baselines). The rules live in [`mago.toml`](./mago.toml) under `[guard.perimeter]` — a forbidden `use` statement fails the build, not a reviewer.
+
+Production code under `Waffle\Commons\HttpClient` may depend **only** on:
+
+- `Waffle\Commons\HttpClient\**` — itself
+- `Waffle\Commons\Contracts\**` — the shared contracts package, the **only** Waffle dependency permitted
+- `Psr\**` — PSR interfaces (PSR-7 / PSR-17 / PSR-18)
+- `@global` + `Psl\**` — PHP core (including `ext-curl`) and the PHP Standard Library
+
+Test code under `WaffleTests\Commons\HttpClient` is unrestricted (`@all`); the `tests/src/ClientTest.php` `php-mock` fixture is listed in `[guard].excludes` because it re-declares the production namespace to stub libcurl. Structural rules are guarded too: interfaces must be named `*Interface`, `Exception\**` classes must end in `*Exception`, and any `Enum\**` namespace may hold only `enum` declarations.
+
+Contract-first, component-agnostic by construction: components compose through `waffle-commons/contracts`, never directly through one another.
 
 ## 🧪 Testing
 
