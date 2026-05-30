@@ -1,3 +1,4 @@
+[![Discord](https://img.shields.io/discord/755288001592033391?logo=discord)](https://discord.gg/eKgywnfXr2)
 [![PHP Version Require](http://poser.pugx.org/waffle-commons/http-client/require/php)](https://packagist.org/packages/waffle-commons/http-client)
 [![PHP CI](https://github.com/waffle-commons/http-client/actions/workflows/main.yml/badge.svg)](https://github.com/waffle-commons/http-client/actions/workflows/main.yml)
 [![codecov](https://codecov.io/gh/waffle-commons/http-client/graph/badge.svg)](https://codecov.io/gh/waffle-commons/http-client)
