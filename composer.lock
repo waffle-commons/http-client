@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "dd2140336c5b6b73efd456e66fbe33d2",
+    "content-hash": "f6dc41c9b889bdbf226fc40ce4f586c8",
     "packages": [
         {
             "name": "psr/cache",
@@ -588,6 +588,56 @@
                 "source": "https://github.com/waffle-commons/contracts/tree/main"
             },
             "time": "2026-06-07T00:39:38+00:00"
+        },
+        {
+            "name": "waffle-commons/utils",
+            "version": "dev-main",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/waffle-commons/utils.git",
+                "reference": "10fbc6e9f824ba2635e70acf0e96186eb966d552"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/waffle-commons/utils/zipball/10fbc6e9f824ba2635e70acf0e96186eb966d552",
+                "reference": "10fbc6e9f824ba2635e70acf0e96186eb966d552",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^8.5",
+                "waffle-commons/contracts": "self.version"
+            },
+            "require-dev": {
+                "carthage-software/mago": "^1.29",
+                "cyclonedx/cyclonedx-php-composer": "^6.2",
+                "igor-php/igor-php": "^0.6.3",
+                "php-mock/php-mock-phpunit": "^2.15",
+                "phpunit/phpunit": "^12.5",
+                "vimeo/psalm": "^6.16"
+            },
+            "default-branch": true,
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Waffle\\Commons\\Utils\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Leslie Petrimaux",
+                    "email": "contact@waffle-commons.cloud"
+                }
+            ],
+            "description": "Utils component for Waffle framework.",
+            "support": {
+                "issues": "https://github.com/waffle-commons/utils/issues",
+                "source": "https://github.com/waffle-commons/utils/tree/main"
+            },
+            "time": "2026-06-07T00:40:55+00:00"
         }
     ],
     "packages-dev": [
@@ -2238,16 +2288,16 @@
         },
         {
             "name": "igor-php/igor-php",
-            "version": "v0.6.3",
+            "version": "v0.7.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/igor-php/igor-php.git",
-                "reference": "9aecff9843f27eb9adb674172abfae7b2d18d295"
+                "reference": "c22297f5916f47d9f35c20f14f9ea536d9315880"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/igor-php/igor-php/zipball/9aecff9843f27eb9adb674172abfae7b2d18d295",
-                "reference": "9aecff9843f27eb9adb674172abfae7b2d18d295",
+                "url": "https://api.github.com/repos/igor-php/igor-php/zipball/c22297f5916f47d9f35c20f14f9ea536d9315880",
+                "reference": "c22297f5916f47d9f35c20f14f9ea536d9315880",
                 "shasum": ""
             },
             "require": {
@@ -2282,9 +2332,9 @@
             ],
             "support": {
                 "issues": "https://github.com/igor-php/igor-php/issues",
-                "source": "https://github.com/igor-php/igor-php/tree/v0.6.3"
+                "source": "https://github.com/igor-php/igor-php/tree/v0.7.0"
             },
-            "time": "2026-05-26T20:17:14+00:00"
+            "time": "2026-06-08T12:30:49+00:00"
         },
         {
             "name": "kelunik/certificate",
@@ -6265,7 +6315,8 @@
     "aliases": [],
     "minimum-stability": "stable",
     "stability-flags": {
-        "waffle-commons/contracts": 20
+        "waffle-commons/contracts": 20,
+        "waffle-commons/utils": 20
     },
     "prefer-stable": false,
     "prefer-lowest": false,
