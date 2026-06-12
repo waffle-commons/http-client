@@ -24,13 +24,26 @@ use Waffle\Commons\Utils\Assert;
  * address is non-public the whole request is refused (fail-closed), defeating
  * a rebinding record that mixes a public and a private answer.
  *
- * Stateless across requests (FrankenPHP rule): the resolver is injected and the
- * guard holds no per-request state.
+ * Because the guard is meant to be wired on by DEFAULT, an explicit allow-list
+ * lets an application keep talking to known internal hosts (a legacy backend, a
+ * sidecar) without dropping the protection for everything else. An entry matches
+ * either by exact host name (case-insensitive) or, for a literal-IP target, by a
+ * CIDR range; a match bypasses the public-IP assertion and the pinning step,
+ * deferring to cURL's normal resolution for that one trusted host.
+ *
+ * Stateless across requests (FrankenPHP rule): the resolver and allow-list are
+ * injected and the guard holds no per-request state.
  */
 final readonly class SsrfGuard
 {
+    /**
+     * @param list<string> $allowedHosts Trusted internal targets exempt from the
+     *        public-IP assertion: exact host names and/or CIDR ranges (e.g.
+     *        `['legacy-backend', '10.0.0.0/8']`). Empty keeps the guard strict.
+     */
     public function __construct(
         private HostResolverInterface $resolver = new SystemHostResolver(),
+        private array $allowedHosts = [],
     ) {}
 
     /**
@@ -51,6 +64,10 @@ final readonly class SsrfGuard
 
         $bareHost = trim($host, '[]');
         $isLiteral = filter_var($bareHost, FILTER_VALIDATE_IP) !== false;
+
+        if ($this->isAllowlisted($bareHost, $isLiteral)) {
+            return [];
+        }
 
         $addresses = $isLiteral ? [$bareHost] : $this->resolver->resolve($host);
         if ($addresses === []) {
@@ -75,5 +92,25 @@ final readonly class SsrfGuard
         $port = $uri->getPort() ?? ($scheme === 'https' ? 443 : 80);
 
         return [sprintf('%s:%d:%s', $host, $port, implode(',', $addresses))];
+    }
+
+    /**
+     * Whether the target is an explicitly trusted internal host exempt from the
+     * public-IP assertion (exact host-name match, or a literal IP inside a
+     * configured CIDR range).
+     */
+    private function isAllowlisted(string $bareHost, bool $isLiteral): bool
+    {
+        foreach ($this->allowedHosts as $entry) {
+            if (strcasecmp($bareHost, $entry) === 0) {
+                return true;
+            }
+
+            if ($isLiteral && str_contains($entry, '/') && Assert::ipInCidr($bareHost, $entry)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

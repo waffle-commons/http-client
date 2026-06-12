@@ -127,10 +127,48 @@ final class SsrfGuardTest extends TestCase
         $guard->resolvePins($request);
     }
 
+    public function testAllowlistedHostNameBypassesPublicAssertion(): void
+    {
+        // A trusted internal backend resolving to a private IP is allowed through
+        // (no pins) when explicitly allow-listed — this is what lets the guard be
+        // wired on by default without breaking internal calls.
+        $guard = $this->guardResolving(['legacy-backend' => ['10.0.0.5']], ['legacy-backend']);
+        $request = $this->psr17->createRequest('GET', 'http://legacy-backend/api/users');
+
+        self::assertSame([], $guard->resolvePins($request));
+    }
+
+    public function testAllowlistMatchIsCaseInsensitive(): void
+    {
+        $guard = $this->guardResolving(['legacy-backend' => ['10.0.0.5']], ['legacy-backend']);
+        $request = $this->psr17->createRequest('GET', 'http://Legacy-Backend/health');
+
+        self::assertSame([], $guard->resolvePins($request));
+    }
+
+    public function testAllowlistedLiteralIpWithinCidrBypasses(): void
+    {
+        $guard = $this->guardResolving([], ['10.0.0.0/8']);
+        $request = $this->psr17->createRequest('GET', 'http://10.1.2.3:8080/internal');
+
+        self::assertSame([], $guard->resolvePins($request));
+    }
+
+    public function testNonAllowlistedPrivateHostIsStillRejected(): void
+    {
+        // The allow-list is exact: a different internal host is not exempt.
+        $guard = $this->guardResolving(['other-internal' => ['10.0.0.9']], ['legacy-backend']);
+        $request = $this->psr17->createRequest('GET', 'http://other-internal/');
+
+        $this->expectException(SsrfException::class);
+        $guard->resolvePins($request);
+    }
+
     /**
-     * @param array<string, list<string>> $map host => resolved IPs
+     * @param array<string, list<string>> $map          host => resolved IPs
+     * @param list<string>                 $allowedHosts trusted host names / CIDRs
      */
-    private function guardResolving(array $map): SsrfGuard
+    private function guardResolving(array $map, array $allowedHosts = []): SsrfGuard
     {
         $resolver = new class($map) implements HostResolverInterface {
             /**
@@ -147,6 +185,6 @@ final class SsrfGuardTest extends TestCase
             }
         };
 
-        return new SsrfGuard($resolver);
+        return new SsrfGuard($resolver, $allowedHosts);
     }
 }
