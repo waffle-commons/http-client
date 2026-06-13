@@ -291,8 +291,8 @@ final readonly class Client implements ClientInterface
             return $length;
         }
 
-        $name = strtolower(trim(substr($trimmed, 0, $colon)));
-        $value = trim(substr($trimmed, $colon + 1));
+        $name = strtolower(mb_trim(substr($trimmed, 0, $colon)));
+        $value = mb_trim(substr($trimmed, $colon + 1));
 
         $headers[$name] ??= [];
         $headers[$name][] = $value;
