@@ -5,6 +5,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Released in lockstep with the Waffle Commons umbrella tag.
 
+## [0.1.0-beta4] — 2026-06-13
+
+**Theme: SSRF protection on by default.**
+
+### Added
+- `SsrfGuard` is now **default-on**: every outbound request runs resolve → validate (reject private/loopback/reserved CIDRs) → pin (`CURLOPT_RESOLVE`), closing the DNS-rebind TOCTOU window; automatic redirect-following is disabled (SEC-02).
+- IPv6/AAAA host resolution in `SystemHostResolver`, plus an internal-host allowlist (exact host or CIDR) so explicitly-trusted private backends still resolve.
+
+### Changed
+- Worker-safety migration to igor-php 0.7 (`#[WorkerSafe]`).
+
 ## [0.1.0-beta3] — 2026-06-07
 
 **Theme: identity federation & stateless persistence (ecosystem wave).**
