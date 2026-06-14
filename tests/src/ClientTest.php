@@ -17,6 +17,9 @@ use Waffle\Commons\HttpClient\Client;
 use Waffle\Commons\HttpClient\Exception\HttpClientException;
 use Waffle\Commons\HttpClient\Exception\NetworkException;
 use Waffle\Commons\HttpClient\Exception\RequestException;
+use Waffle\Commons\HttpClient\Exception\SsrfException;
+use Waffle\Commons\HttpClient\Security\HostResolverInterface;
+use Waffle\Commons\HttpClient\Security\SsrfGuard;
 
 #[CoversClass(Client::class)]
 final class ClientTest extends AbstractTestCase
@@ -368,6 +371,41 @@ final class ClientTest extends AbstractTestCase
         self::assertSame('text/plain', $response->getHeaderLine('content-type'));
         self::assertFalse($response->hasHeader('location'));
         self::assertSame('final-body', (string) $response->getBody());
+    }
+
+    public function testSsrfGuardPinsResolvedHostIntoCurlResolve(): void
+    {
+        $this->mockTransfer(["HTTP/1.1 200 OK\r\n", "\r\n"], []);
+
+        $guard = new SsrfGuard(new class implements HostResolverInterface {
+            #[\Override]
+            public function resolve(string $host): array
+            {
+                return ['93.184.216.34'];
+            }
+        });
+
+        $client = new Client($this->psr17, $this->psr17, $guard);
+        $client->sendRequest($this->psr17->createRequest('GET', 'https://example.com/'));
+
+        self::assertSame(['example.com:443:93.184.216.34'], $this->capturedOptions[CURLOPT_RESOLVE]);
+    }
+
+    public function testSsrfGuardBlocksPrivateResolutionBeforeTransfer(): void
+    {
+        // No transfer primed: the guard must reject before any cURL transfer runs.
+        $guard = new SsrfGuard(new class implements HostResolverInterface {
+            #[\Override]
+            public function resolve(string $host): array
+            {
+                return ['127.0.0.1'];
+            }
+        });
+
+        $client = new Client($this->psr17, $this->psr17, $guard);
+
+        $this->expectException(SsrfException::class);
+        $client->sendRequest($this->psr17->createRequest('GET', 'https://internal.example.com/'));
     }
 
     private function dispatch(RequestInterface $request): ResponseInterface

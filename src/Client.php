@@ -15,6 +15,7 @@ use Psr\Http\Message\StreamInterface;
 use Waffle\Commons\HttpClient\Exception\HttpClientException;
 use Waffle\Commons\HttpClient\Exception\NetworkException;
 use Waffle\Commons\HttpClient\Exception\RequestException;
+use Waffle\Commons\HttpClient\Security\SsrfGuard;
 
 /**
  * High-performance PSR-18 HTTP client tuned for FrankenPHP resident-worker proxying.
@@ -36,6 +37,11 @@ use Waffle\Commons\HttpClient\Exception\RequestException;
  * from the PSR-7 request stream via `CURLOPT_READFUNCTION` (`CURLOPT_UPLOAD`),
  * so proxying a large multipart/chunked upload never buffers the whole payload
  * in worker RAM.
+ *
+ * **SSRF defence (SEC-02).** When a {@see SsrfGuard} is injected, every request
+ * has its target host resolved and validated against private/reserved ranges,
+ * and the vetted IP is pinned via `CURLOPT_RESOLVE` before the transfer — the
+ * transport can never connect to an internal address, even under DNS rebinding.
  *
  * Connect and total timeouts are hardcoded ceilings (1s / 10s) and cannot be
  * raised by callers — a hung legacy backend must never lock a worker thread.
@@ -64,6 +70,7 @@ final readonly class Client implements ClientInterface
     public function __construct(
         private ResponseFactoryInterface $responseFactory,
         private StreamFactoryInterface $streamFactory,
+        private ?SsrfGuard $ssrfGuard = null,
     ) {
         $handle = curl_init();
         if (!$handle instanceof CurlHandle) {
@@ -77,18 +84,24 @@ final readonly class Client implements ClientInterface
     /**
      * @throws NetworkException On transport-layer failure (DNS, connect/read timeout, TLS, reset).
      * @throws RequestException On protocol-level failure or empty response.
+     * @throws \Waffle\Commons\HttpClient\Exception\SsrfException When the guard rejects the target host.
      */
     #[\Override]
     public function sendRequest(RequestInterface $request): ResponseInterface
     {
         curl_reset($this->handle);
 
+        // SEC-02: resolve + validate the target host (and obtain CURLOPT_RESOLVE
+        // pins) BEFORE any allocation or transfer. A non-public resolution
+        // throws SsrfException here — fail-closed, no socket is ever opened.
+        $resolvePins = $this->ssrfGuard?->resolvePins($request) ?? [];
+
         $body = $this->streamFactory->createStream('');
         $statusLine = '';
         /** @var array<string, list<string>> $headers */
         $headers = [];
 
-        $this->applyRequest($request, $body, $statusLine, $headers);
+        $this->applyRequest($request, $resolvePins, $body, $statusLine, $headers);
 
         [$errno, $errorMessage] = $this->execute();
         if ($errno !== CURLE_OK) {
@@ -153,15 +166,17 @@ final readonly class Client implements ClientInterface
     }
 
     /**
+     * @param list<string>                $resolvePins SEC-02 `CURLOPT_RESOLVE` pins (`host:port:ip`).
      * @param array<string, list<string>> $headers
      */
     private function applyRequest(
         RequestInterface $request,
+        array $resolvePins,
         StreamInterface $body,
         string &$statusLine,
         array &$headers,
     ): void {
-        curl_setopt_array($this->handle, [
+        $options = [
             CURLOPT_URL => (string) $request->getUri(),
             CURLOPT_CUSTOMREQUEST => $request->getMethod(),
             CURLOPT_HTTP_VERSION => $this->resolveHttpVersion($request->getProtocolVersion()),
@@ -190,7 +205,15 @@ final readonly class Client implements ClientInterface
             CURLOPT_WRITEFUNCTION => static function (CurlHandle $_handle, string $chunk) use ($body): int {
                 return $body->write($chunk);
             },
-        ]);
+        ];
+
+        // SEC-02: pin the validated IP(s) so the transport connects to exactly
+        // the address the guard vetted — closing the DNS-rebinding / TOCTOU gap.
+        if ($resolvePins !== []) {
+            $options[CURLOPT_RESOLVE] = $resolvePins;
+        }
+
+        curl_setopt_array($this->handle, $options);
 
         $this->applyRequestBody($request);
     }
@@ -268,8 +291,8 @@ final readonly class Client implements ClientInterface
             return $length;
         }
 
-        $name = strtolower(trim(substr($trimmed, 0, $colon)));
-        $value = trim(substr($trimmed, $colon + 1));
+        $name = strtolower(mb_trim(substr($trimmed, 0, $colon)));
+        $value = mb_trim(substr($trimmed, $colon + 1));
 
         $headers[$name] ??= [];
         $headers[$name][] = $value;

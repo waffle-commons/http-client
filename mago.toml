@@ -21,6 +21,7 @@ mode = "default"
 excludes = [
     "tests/bootstrap.php",
     "tests/src/ClientTest.php",
+    "tests/src/Security/SystemHostResolverTest.php",
 ]
 
 [guard.perimeter]
@@ -35,6 +36,7 @@ namespace = "Waffle\\Commons\\HttpClient"
 permit = [
     "Waffle\\Commons\\HttpClient\\**",
     "Waffle\\Commons\\Contracts\\**",
+    "Waffle\\Commons\\Utils\\**",
     "@layer:core",
     "@layer:psr",
 ]
