@@ -141,13 +141,11 @@ final readonly class Client implements ClientInterface
                 return [CURLE_RECV_ERROR, curl_multi_strerror($status) ?? 'cURL multi handle failure.'];
             }
 
-            // Drain the message queue for this transfer's terminal result code.
+            // Drain the message queue for this transfer's terminal result code via a
+            // typed wrapper, so the loop never assigns cURL's mixed-typed
+            // curl_multi_info_read() return (see readMultiInfo()).
             $result = CURLE_OK;
-            // $queued is a mandatory by-ref out-param (remaining messages); we
-            // don't use it, and cURL's stub types it as mixed.
-            // @mago-ignore analysis:mixed-assignment
-            $queued = 0;
-            while (($info = curl_multi_info_read($this->multiHandle, $queued)) !== false) {
+            while (($info = $this->readMultiInfo()) !== false) {
                 if ($info['msg'] !== CURLMSG_DONE) {
                     continue;
                 }
@@ -163,6 +161,27 @@ final readonly class Client implements ClientInterface
         } finally {
             curl_multi_remove_handle($this->multiHandle, $this->handle);
         }
+    }
+
+    /**
+     * Typed wrapper over the cURL extension's `curl_multi_info_read()`, giving the
+     * drain loop a clean, fully-typed `array|false` boundary.
+     *
+     * The one irreducible snag is the mandatory by-ref `$queued_messages` out-param
+     * (which we never read): Mago's bundled stub mistypes it as `mixed` and refuses
+     * to write `mixed` into any typed target (local `@var`, typed by-ref param — all
+     * rejected), and Mago 1.30 offers no per-function stub override. So a single,
+     * accurately-scoped suppression is isolated HERE rather than wrapping the hot
+     * loop — and it is the `$queued` out-param, not the (correctly typed) return.
+     *
+     * @return array{handle: resource, msg: int, result: int}|false
+     */
+    private function readMultiInfo(): array|false
+    {
+        $queued = 0;
+
+        // @mago-ignore analysis:mixed-assignment -- cURL stub mistypes the by-ref out-param.
+        return curl_multi_info_read($this->multiHandle, $queued);
     }
 
     /**
