@@ -12,6 +12,13 @@ use Psr\Http\Message\ResponseFactoryInterface;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Psr\Http\Message\StreamInterface;
+use Throwable;
+use Waffle\Commons\Contracts\Telemetry\Enum\SpanKind;
+use Waffle\Commons\Contracts\Telemetry\Enum\SpanStatus;
+use Waffle\Commons\Contracts\Telemetry\NullTextMapPropagator;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TextMapPropagatorInterface;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\HttpClient\Exception\HttpClientException;
 use Waffle\Commons\HttpClient\Exception\NetworkException;
 use Waffle\Commons\HttpClient\Exception\RequestException;
@@ -71,6 +78,8 @@ final readonly class Client implements ClientInterface
         private ResponseFactoryInterface $responseFactory,
         private StreamFactoryInterface $streamFactory,
         private ?SsrfGuard $ssrfGuard = null,
+        private TracerInterface $tracer = new NullTracer(),
+        private TextMapPropagatorInterface $propagator = new NullTextMapPropagator(),
     ) {
         $handle = curl_init();
         if (!$handle instanceof CurlHandle) {
@@ -82,12 +91,54 @@ final readonly class Client implements ClientInterface
     }
 
     /**
+     * Wraps the transfer in a CLIENT span and injects W3C trace context onto the
+     * outbound request, so a distributed trace continues across the service boundary.
+     */
+    #[\Override]
+    public function sendRequest(RequestInterface $request): ResponseInterface
+    {
+        $span = $this->tracer->startSpan('http.client.request', SpanKind::Client);
+        $span->setAttribute('http.request.method', $request->getMethod());
+        $span->setAttribute('url.full', (string) $request->getUri());
+
+        try {
+            $response = $this->send($this->injectTraceContext($request));
+            $span->setAttribute('http.response.status_code', $response->getStatusCode());
+
+            return $response;
+        } catch (Throwable $error) {
+            $span->recordException($error);
+            $span->setStatus(SpanStatus::Error);
+
+            throw $error;
+        } finally {
+            $span->end();
+        }
+    }
+
+    /** Inject the active trace context (`traceparent`/`tracestate`) onto the outbound request. */
+    private function injectTraceContext(RequestInterface $request): RequestInterface
+    {
+        $context = $this->tracer->currentContext();
+        if ($context === null) {
+            return $request;
+        }
+
+        $carrier = [];
+        $this->propagator->inject($context, $carrier);
+        foreach ($carrier as $name => $value) {
+            $request = $request->withHeader($name, $value);
+        }
+
+        return $request;
+    }
+
+    /**
      * @throws NetworkException On transport-layer failure (DNS, connect/read timeout, TLS, reset).
      * @throws RequestException On protocol-level failure or empty response.
      * @throws \Waffle\Commons\HttpClient\Exception\SsrfException When the guard rejects the target host.
      */
-    #[\Override]
-    public function sendRequest(RequestInterface $request): ResponseInterface
+    private function send(RequestInterface $request): ResponseInterface
     {
         curl_reset($this->handle);
 
@@ -141,18 +192,10 @@ final readonly class Client implements ClientInterface
                 return [CURLE_RECV_ERROR, curl_multi_strerror($status) ?? 'cURL multi handle failure.'];
             }
 
-            // Drain the message queue for this transfer's terminal result code via a
-            // typed wrapper, so the loop never assigns cURL's mixed-typed
-            // curl_multi_info_read() return (see readMultiInfo()).
-            $result = CURLE_OK;
-            while (($info = $this->readMultiInfo()) !== false) {
-                if ($info['msg'] !== CURLMSG_DONE) {
-                    continue;
-                }
-
-                $result = (int) $info['result'];
-            }
-
+            // Single easy handle: its terminal CURLcode IS the transfer result, so
+            // read it straight off the handle — no curl_multi_info_read() drain (and
+            // none of its mixed-typed by-ref out-param) needed (POLICY-05).
+            $result = curl_errno($this->handle);
             if ($result !== CURLE_OK) {
                 return [$result, curl_error($this->handle)];
             }
@@ -161,27 +204,6 @@ final readonly class Client implements ClientInterface
         } finally {
             curl_multi_remove_handle($this->multiHandle, $this->handle);
         }
-    }
-
-    /**
-     * Typed wrapper over the cURL extension's `curl_multi_info_read()`, giving the
-     * drain loop a clean, fully-typed `array|false` boundary.
-     *
-     * The one irreducible snag is the mandatory by-ref `$queued_messages` out-param
-     * (which we never read): Mago's bundled stub mistypes it as `mixed` and refuses
-     * to write `mixed` into any typed target (local `@var`, typed by-ref param — all
-     * rejected), and Mago 1.30 offers no per-function stub override. So a single,
-     * accurately-scoped suppression is isolated HERE rather than wrapping the hot
-     * loop — and it is the `$queued` out-param, not the (correctly typed) return.
-     *
-     * @return array{handle: resource, msg: int, result: int}|false
-     */
-    private function readMultiInfo(): array|false
-    {
-        $queued = 0;
-
-        // @mago-ignore analysis:mixed-assignment -- cURL stub mistypes the by-ref out-param.
-        return curl_multi_info_read($this->multiHandle, $queued);
     }
 
     /**
