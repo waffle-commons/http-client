@@ -44,7 +44,7 @@ jobs:
         run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -70,7 +70,7 @@ jobs:
           php-version: ${{ matrix.php-version }}
           tools: composer:v2
       - name: Cache Composer dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.composer/cache
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -95,7 +95,7 @@ jobs:
           php-version: ${{ matrix.php-version }}
           tools: composer:v2
       - name: Cache and Install
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.composer/cache
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -116,7 +116,7 @@ jobs:
         with:
           php-version: ${{ matrix.php-version }}
           tools: composer:v2
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.composer/cache
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -137,7 +137,7 @@ jobs:
         with:
           php-version: ${{ matrix.php-version }}
           tools: composer:v2
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.composer/cache
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -158,7 +158,7 @@ jobs:
         with:
           php-version: ${{ matrix.php-version }}
           tools: composer:v2
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.composer/cache
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -200,7 +200,7 @@ jobs:
         with:
           php-version: ${{ matrix.php-version }}
           tools: composer:v2
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.composer/cache
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -225,7 +225,7 @@ jobs:
         with:
           php-version: ${{ matrix.php-version }}
           tools: composer:v2
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.composer/cache
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -251,7 +251,7 @@ jobs:
           extensions: gd, pgsql, pdo_mysql, pdo_pgsql, gmp, fileinfo, intl, opcache, xml, iconv, redis, mailparse
           coverage: xdebug
           tools: composer:v2
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.composer/cache
           key: ${{ runner.os }}-php-${{ matrix.php-version }}-composer-${{ hashFiles('**/composer.lock') }}
