@@ -45,9 +45,6 @@ final class ClientTest extends AbstractTestCase
     /** Per-request `curl_multi_exec` tick counter (reset on each add_handle). */
     private int $execStage = 0;
 
-    /** Whether the single CURLMSG_DONE message has been consumed this request. */
-    private bool $infoRead = false;
-
     #[\Override]
     protected function setUp(): void
     {
@@ -59,7 +56,6 @@ final class ClientTest extends AbstractTestCase
         $this->writeCallback = null;
         $this->capturedHandle = null;
         $this->execStage = 0;
-        $this->infoRead = false;
     }
 
     public function testConstructorThrowsWhenCurlInitFails(): void
@@ -447,7 +443,6 @@ final class ClientTest extends AbstractTestCase
             ->willReturnCallback(function (CurlMultiHandle $_mh, CurlHandle $_h): int {
                 // add_handle runs exactly once per execute(); reset per-request state here.
                 $this->execStage = 0;
-                $this->infoRead = false;
                 return 0;
             });
 
@@ -477,15 +472,9 @@ final class ClientTest extends AbstractTestCase
             });
 
         $this
-            ->getFunctionMock(self::NS, 'curl_multi_info_read')
+            ->getFunctionMock(self::NS, 'curl_errno')
             ->expects($this->any())
-            ->willReturnCallback(function (CurlMultiHandle $_mh) use ($result): array|false {
-                if ($this->infoRead) {
-                    return false;
-                }
-                $this->infoRead = true;
-                return ['msg' => CURLMSG_DONE, 'result' => $result, 'handle' => $this->capturedHandle];
-            });
+            ->willReturnCallback(static fn(CurlHandle $_h): int => $result);
     }
 
     /**

@@ -12,9 +12,19 @@ use Psr\Http\Message\ResponseFactoryInterface;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Psr\Http\Message\StreamInterface;
+use Throwable;
+use Waffle\Commons\Contracts\HttpClient\ConcurrentClientInterface;
+use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
+use Waffle\Commons\Contracts\Telemetry\Enum\SpanKind;
+use Waffle\Commons\Contracts\Telemetry\Enum\SpanStatus;
+use Waffle\Commons\Contracts\Telemetry\NullTextMapPropagator;
+use Waffle\Commons\Contracts\Telemetry\NullTracer;
+use Waffle\Commons\Contracts\Telemetry\TextMapPropagatorInterface;
+use Waffle\Commons\Contracts\Telemetry\TracerInterface;
 use Waffle\Commons\HttpClient\Exception\HttpClientException;
 use Waffle\Commons\HttpClient\Exception\NetworkException;
 use Waffle\Commons\HttpClient\Exception\RequestException;
+use Waffle\Commons\HttpClient\Promise\Promise;
 use Waffle\Commons\HttpClient\Security\SsrfGuard;
 
 /**
@@ -28,8 +38,17 @@ use Waffle\Commons\HttpClient\Security\SsrfGuard;
  * transfer is driven through the multi interface: the worker parks on
  * `curl_multi_select()` (a socket-level wait) between `curl_multi_exec()` ticks
  * instead of busy-spinning a CPU. The multi handle is the building block for
- * future concurrent fan-out, and a slow legacy backend can no longer pin the
- * worker on a blocking syscall beyond the hard timeout ceiling.
+ * concurrent fan-out (see {@see self::sendRequests()} / {@see self::promise()}),
+ * and a slow legacy backend can no longer pin the worker on a blocking syscall
+ * beyond the hard timeout ceiling.
+ *
+ * **Concurrent fan-out (ASYNC-02).** {@see self::sendRequests()} allocates one
+ * dedicated easy handle per request, registers them all on a single multi
+ * handle and drives one shared `curl_multi_exec()` loop, so N requests complete
+ * in roughly the wall-clock of the slowest one. {@see self::promise()} hands the
+ * caller a non-blocking {@see PromiseInterface} over a single in-flight request.
+ * Per-request handles are created and closed within the call — the only resident
+ * state is the persistent easy/multi handle, so the client stays worker-safe.
  *
  * **Bounded memory, both directions.** Response bodies are streamed in 8 KiB
  * chunks into a PSR-7 stream via `CURLOPT_WRITEFUNCTION`; the full body is never
@@ -46,7 +65,7 @@ use Waffle\Commons\HttpClient\Security\SsrfGuard;
  * Connect and total timeouts are hardcoded ceilings (1s / 10s) and cannot be
  * raised by callers — a hung legacy backend must never lock a worker thread.
  */
-final readonly class Client implements ClientInterface
+final readonly class Client implements ClientInterface, ConcurrentClientInterface
 {
     /** Maximum time to establish a TCP/TLS connection (ms). */
     public const int CONNECT_TIMEOUT_MS = 1000;
@@ -60,6 +79,13 @@ final readonly class Client implements ClientInterface
     /** Upper bound (seconds) the worker parks on `curl_multi_select()` per tick. */
     private const float SELECT_TIMEOUT = 1.0;
 
+    /**
+     * Back-off (microseconds) when `curl_multi_select()` returns -1 (no file
+     * descriptors to wait on) so the drive loop cannot busy-spin a CPU. This is
+     * the back-off the cURL manual recommends for the no-fds case.
+     */
+    private const int SELECT_BACKOFF_US = 100;
+
     private CurlHandle $handle;
 
     private CurlMultiHandle $multiHandle;
@@ -71,6 +97,8 @@ final readonly class Client implements ClientInterface
         private ResponseFactoryInterface $responseFactory,
         private StreamFactoryInterface $streamFactory,
         private ?SsrfGuard $ssrfGuard = null,
+        private TracerInterface $tracer = new NullTracer(),
+        private TextMapPropagatorInterface $propagator = new NullTextMapPropagator(),
     ) {
         $handle = curl_init();
         if (!$handle instanceof CurlHandle) {
@@ -82,12 +110,169 @@ final readonly class Client implements ClientInterface
     }
 
     /**
+     * Wraps the transfer in a CLIENT span and injects W3C trace context onto the
+     * outbound request, so a distributed trace continues across the service boundary.
+     */
+    #[\Override]
+    public function sendRequest(RequestInterface $request): ResponseInterface
+    {
+        $span = $this->tracer->startSpan('http.client.request', SpanKind::Client);
+        $span->setAttribute('http.request.method', $request->getMethod());
+        $span->setAttribute('url.full', (string) $request->getUri());
+
+        try {
+            $response = $this->send($this->injectTraceContext($request));
+            $span->setAttribute('http.response.status_code', $response->getStatusCode());
+
+            return $response;
+        } catch (Throwable $error) {
+            $span->recordException($error);
+            $span->setStatus(SpanStatus::Error);
+
+            throw $error;
+        } finally {
+            $span->end();
+        }
+    }
+
+    /**
+     * Resolve several requests concurrently and return their responses.
+     *
+     * Allocates one dedicated easy handle per request (the persistent
+     * single-request handle is left untouched), registers every handle on a
+     * single multi handle and drives one shared `curl_multi_exec()` loop, so the
+     * whole batch settles in roughly the wall-clock of the slowest request.
+     * Array keys are preserved, so the result lines up 1:1 with the input. Each
+     * per-request handle is removed and closed in a `finally`, leaving no
+     * resident cross-request state.
+     *
+     * On any failure (transport, protocol, or SSRF refusal) the offending
+     * request's mapped exception is thrown — fail-fast, so partial results are
+     * never silently returned.
+     *
+     * @param array<array-key, RequestInterface> $requests
+     *
+     * @return array<array-key, ResponseInterface>
+     *
+     * @throws NetworkException On transport-layer failure (DNS, connect/read timeout, TLS, reset).
+     * @throws RequestException On protocol-level failure or empty response.
+     * @throws \Waffle\Commons\HttpClient\Exception\SsrfException When the guard rejects a target host.
+     */
+    #[\Override]
+    public function sendRequests(array $requests): array
+    {
+        if ($requests === []) {
+            return [];
+        }
+
+        $multiHandle = curl_multi_init();
+
+        $firstRequest = $requests[array_key_first($requests)];
+
+        /** @var array<array-key, Transfer> $transfers */
+        $transfers = [];
+        try {
+            foreach ($requests as $key => $request) {
+                $transfer = $this->prepareTransfer($this->injectTraceContext($request));
+                curl_multi_add_handle($multiHandle, $transfer->handle);
+                $transfers[$key] = $transfer;
+            }
+
+            $status = $this->drive($multiHandle);
+            // A CURLM_* loop failure is surfaced against the FIRST request rather
+            // than silently proceeding with half-built transfers (ASYNC02-01).
+            if ($status !== CURLM_OK) {
+                throw $this->mapMultiError($firstRequest, $status);
+            }
+
+            $responses = [];
+            foreach ($transfers as $key => $transfer) {
+                $responses[$key] = $this->finishTransfer($transfer);
+            }
+
+            return $responses;
+        } finally {
+            // Detach every per-request handle from the multi handle and free it.
+            // In PHP 8.x a CurlHandle is a GC-managed object (curl_close is a
+            // deprecated no-op), so dropping the last reference releases it — no
+            // per-request state survives the call.
+            foreach ($transfers as $transfer) {
+                curl_multi_remove_handle($multiHandle, $transfer->handle);
+            }
+            curl_multi_close($multiHandle);
+        }
+    }
+
+    /**
+     * Start a single request and return a non-blocking {@see PromiseInterface}.
+     *
+     * A dedicated easy handle is allocated and registered on a per-promise multi
+     * handle; the transfer is driven only when the caller invokes
+     * {@see PromiseInterface::wait()}, which builds and caches the response (or
+     * captures the failure), settles the state exactly once and fires any
+     * registered `then`/`catch` callbacks.
+     *
+     * The per-promise easy + multi handle are allocated eagerly so the transfer
+     * can start, but they are freed by a dedicated cleanup closure handed to the
+     * {@see Promise}: the promise runs it exactly once — when it settles, or, if
+     * {@see PromiseInterface::wait()} is never called, from its destructor — so an
+     * un-waited promise can never accumulate handles across requests (ASYNC02-04).
+     *
+     * @throws \Waffle\Commons\HttpClient\Exception\SsrfException When the guard rejects the target host.
+     */
+    #[\Override]
+    public function promise(RequestInterface $request): PromiseInterface
+    {
+        $multiHandle = curl_multi_init();
+        $transfer = $this->prepareTransfer($this->injectTraceContext($request));
+        curl_multi_add_handle($multiHandle, $transfer->handle);
+
+        $resolver = function () use ($multiHandle, $transfer): ResponseInterface {
+            $status = $this->drive($multiHandle);
+            // Surface a CURLM_* loop failure instead of reading a half-driven
+            // transfer's terminal result as if it had succeeded (ASYNC02-01).
+            if ($status !== CURLM_OK) {
+                throw $this->mapMultiError($transfer->request, $status);
+            }
+
+            return $this->finishTransfer($transfer);
+        };
+
+        // Detach and free the per-promise handle (PHP 8.x GC-frees the CurlHandle
+        // once its last reference drops; curl_close is a deprecated no-op), so the
+        // promise leaves no resident state. The Promise invokes this once — on
+        // settle OR from its destructor if it is never waited on.
+        $cleanup = static function () use ($multiHandle, $transfer): void {
+            curl_multi_remove_handle($multiHandle, $transfer->handle);
+            curl_multi_close($multiHandle);
+        };
+
+        return new Promise($resolver, $cleanup);
+    }
+
+    /** Inject the active trace context (`traceparent`/`tracestate`) onto the outbound request. */
+    private function injectTraceContext(RequestInterface $request): RequestInterface
+    {
+        $context = $this->tracer->currentContext();
+        if ($context === null) {
+            return $request;
+        }
+
+        $carrier = [];
+        $this->propagator->inject($context, $carrier);
+        foreach ($carrier as $name => $value) {
+            $request = $request->withHeader($name, $value);
+        }
+
+        return $request;
+    }
+
+    /**
      * @throws NetworkException On transport-layer failure (DNS, connect/read timeout, TLS, reset).
      * @throws RequestException On protocol-level failure or empty response.
      * @throws \Waffle\Commons\HttpClient\Exception\SsrfException When the guard rejects the target host.
      */
-    #[\Override]
-    public function sendRequest(RequestInterface $request): ResponseInterface
+    private function send(RequestInterface $request): ResponseInterface
     {
         curl_reset($this->handle);
 
@@ -101,7 +286,7 @@ final readonly class Client implements ClientInterface
         /** @var array<string, list<string>> $headers */
         $headers = [];
 
-        $this->applyRequest($request, $resolvePins, $body, $statusLine, $headers);
+        $this->applyRequest($this->handle, $request, $resolvePins, $body, $statusLine, $headers);
 
         [$errno, $errorMessage] = $this->execute();
         if ($errno !== CURLE_OK) {
@@ -113,6 +298,63 @@ final readonly class Client implements ClientInterface
         }
 
         return $this->buildResponse($statusLine, $headers, $body);
+    }
+
+    /**
+     * Allocate and fully configure a dedicated easy handle for one request,
+     * returning the {@see Transfer} that bundles the handle with the mutable
+     * capture buffers libcurl fills as the transfer progresses.
+     *
+     * Used by the concurrent fan-out and promise paths — the blocking
+     * single-request path reuses the persistent handle instead.
+     *
+     * @throws HttpClientException If the easy handle cannot be allocated.
+     * @throws \Waffle\Commons\HttpClient\Exception\SsrfException When the guard rejects the target host.
+     */
+    private function prepareTransfer(RequestInterface $request): Transfer
+    {
+        // SEC-02: resolve + validate the target host BEFORE allocating the handle.
+        $resolvePins = $this->ssrfGuard?->resolvePins($request) ?? [];
+
+        $handle = curl_init();
+        if (!$handle instanceof CurlHandle) {
+            throw new HttpClientException('Failed to initialise a per-request cURL handle.');
+        }
+
+        $transfer = new Transfer($handle, $request, $this->streamFactory->createStream(''));
+        $this->applyRequest(
+            $handle,
+            $request,
+            $resolvePins,
+            $transfer->body,
+            $transfer->statusLine,
+            $transfer->headers,
+        );
+
+        return $transfer;
+    }
+
+    /**
+     * Read a settled transfer's terminal result and build its PSR-7 response.
+     *
+     * @throws NetworkException On transport-layer failure (DNS, connect/read timeout, TLS, reset).
+     * @throws RequestException On protocol-level failure or empty response.
+     */
+    private function finishTransfer(Transfer $transfer): ResponseInterface
+    {
+        // Each easy handle carries its own terminal CURLcode, so read it straight
+        // off the handle — no curl_multi_info_read() drain (and none of its
+        // mixed-typed by-ref out-param) needed (POLICY-05).
+        $errno = curl_errno($transfer->handle);
+        if ($errno !== CURLE_OK) {
+            throw $this->mapCurlError($transfer->request, $errno, curl_error($transfer->handle));
+        }
+
+        if ($transfer->statusLine === '') {
+            throw new RequestException($transfer->request, 'No HTTP status line received from the remote endpoint.');
+        }
+
+        return $this->buildResponse($transfer->statusLine, $transfer->headers, $transfer->body);
     }
 
     /**
@@ -128,33 +370,15 @@ final readonly class Client implements ClientInterface
         curl_multi_add_handle($this->multiHandle, $this->handle);
 
         try {
-            $running = 0;
-            do {
-                $status = curl_multi_exec($this->multiHandle, $running);
-                if ($running > 0) {
-                    // Block on the socket set (or up to SELECT_TIMEOUT); never spin.
-                    curl_multi_select($this->multiHandle, self::SELECT_TIMEOUT);
-                }
-            } while ($running > 0 && $status === CURLM_OK);
-
+            $status = $this->drive($this->multiHandle);
             if ($status !== CURLM_OK) {
                 return [CURLE_RECV_ERROR, curl_multi_strerror($status) ?? 'cURL multi handle failure.'];
             }
 
-            // Drain the message queue for this transfer's terminal result code.
-            $result = CURLE_OK;
-            // $queued is a mandatory by-ref out-param (remaining messages); we
-            // don't use it, and cURL's stub types it as mixed.
-            // @mago-ignore analysis:mixed-assignment
-            $queued = 0;
-            while (($info = curl_multi_info_read($this->multiHandle, $queued)) !== false) {
-                if ($info['msg'] !== CURLMSG_DONE) {
-                    continue;
-                }
-
-                $result = (int) $info['result'];
-            }
-
+            // Single easy handle: its terminal CURLcode IS the transfer result, so
+            // read it straight off the handle — no curl_multi_info_read() drain (and
+            // none of its mixed-typed by-ref out-param) needed (POLICY-05).
+            $result = curl_errno($this->handle);
             if ($result !== CURLE_OK) {
                 return [$result, curl_error($this->handle)];
             }
@@ -166,10 +390,38 @@ final readonly class Client implements ClientInterface
     }
 
     /**
+     * Pumps a multi handle until every registered easy handle has completed,
+     * parking on `curl_multi_select()` between ticks so the worker never spins.
+     *
+     * @return int The terminal `curl_multi_exec()` status (`CURLM_OK` on success).
+     */
+    private function drive(CurlMultiHandle $multiHandle): int
+    {
+        $running = 0;
+        do {
+            $status = curl_multi_exec($multiHandle, $running);
+            if ($running > 0) {
+                // Block on the socket set (or up to SELECT_TIMEOUT); never spin.
+                // curl_multi_select() returns -1 when there are no file
+                // descriptors to wait on (e.g. before the first connection is
+                // established); without a back-off the loop would busy-spin a CPU
+                // at 100% (ASYNC02-05). Sleep a small fixed interval, exactly as
+                // the cURL manual recommends, then tick again.
+                if (curl_multi_select($multiHandle, self::SELECT_TIMEOUT) === -1) {
+                    usleep(self::SELECT_BACKOFF_US);
+                }
+            }
+        } while ($running > 0 && $status === CURLM_OK);
+
+        return $status;
+    }
+
+    /**
      * @param list<string>                $resolvePins SEC-02 `CURLOPT_RESOLVE` pins (`host:port:ip`).
      * @param array<string, list<string>> $headers
      */
     private function applyRequest(
+        CurlHandle $handle,
         RequestInterface $request,
         array $resolvePins,
         StreamInterface $body,
@@ -213,9 +465,9 @@ final readonly class Client implements ClientInterface
             $options[CURLOPT_RESOLVE] = $resolvePins;
         }
 
-        curl_setopt_array($this->handle, $options);
+        curl_setopt_array($handle, $options);
 
-        $this->applyRequestBody($request);
+        $this->applyRequestBody($handle, $request);
     }
 
     /**
@@ -232,7 +484,7 @@ final readonly class Client implements ClientInterface
      * (Content-Length); when it is not (`getSize() === null`), libcurl falls back
      * to `Transfer-Encoding: chunked`.
      */
-    private function applyRequestBody(RequestInterface $request): void
+    private function applyRequestBody(CurlHandle $handle, RequestInterface $request): void
     {
         $stream = $request->getBody();
         $size = $stream->getSize();
@@ -246,9 +498,9 @@ final readonly class Client implements ClientInterface
             $stream->rewind();
         }
 
-        curl_setopt($this->handle, CURLOPT_UPLOAD, true);
+        curl_setopt($handle, CURLOPT_UPLOAD, true);
         curl_setopt(
-            $this->handle,
+            $handle,
             CURLOPT_READFUNCTION,
             /**
              * @param resource $_stream
@@ -262,7 +514,7 @@ final readonly class Client implements ClientInterface
         );
 
         if ($size !== null) {
-            curl_setopt($this->handle, CURLOPT_INFILESIZE, $size);
+            curl_setopt($handle, CURLOPT_INFILESIZE, $size);
         }
     }
 
@@ -378,5 +630,19 @@ final readonly class Client implements ClientInterface
         }
 
         return new RequestException($request, $description, $errno);
+    }
+
+    /**
+     * Map a non-OK `curl_multi_exec()` terminal status to a transport-layer
+     * failure. A `CURLM_*` code means the multi loop itself broke down (out of
+     * memory, bad handle, internal error) — there is no usable per-handle result,
+     * so the whole batch fails as a {@see NetworkException} rather than being read
+     * as if the transfers had completed (ASYNC02-01).
+     */
+    private function mapMultiError(RequestInterface $request, int $status): NetworkException
+    {
+        $message = curl_multi_strerror($status) ?? 'cURL multi handle failure #' . $status;
+
+        return new NetworkException($request, $message, CURLE_RECV_ERROR);
     }
 }
