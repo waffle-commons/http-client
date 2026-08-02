@@ -106,6 +106,13 @@ docker exec -w /waffle-commons/http-client waffle-dev composer tests
 
 The test suite uses `php-mock/php-mock-phpunit` to stub libcurl entry points (`curl_init`, `curl_setopt_array`, `curl_multi_exec`, `curl_multi_info_read`, …), so PHPUnit runs hermetically without network I/O. Dedicated tests assert the SEC-03 protocol allowlist, the chunked request-body upload, and the non-blocking multi-handle transfer.
 
+## 📚 Documentation
+
+Full guides live in the central Diátaxis documentation tree:
+
+- [Reference — `waffle-commons/http-client`](https://github.com/waffle-commons/documentation/blob/main/reference/http-client.md)
+- [Documentation home](https://github.com/waffle-commons/documentation)
+
 ## 📄 License
 
 MIT — see [LICENSE.md](./LICENSE.md).
