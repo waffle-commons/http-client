@@ -167,7 +167,7 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
 
         $multiHandle = curl_multi_init();
 
-        $firstRequest = $requests[array_key_first($requests)];
+        $firstRequest = reset($requests);
 
         /** @var array<array-key, Transfer> $transfers */
         $transfers = [];
