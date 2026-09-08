@@ -1,6 +1,6 @@
 {
     "name": "waffle-commons/http-client",
-    "description": "HTTP Client component for Waffle framework.",
+    "description": "PSR-18 HTTP client for Waffle Commons: default-on SSRF protection, bounded 8 KiB streaming in both directions, timeout ceilings, and concurrent promise-based fan-out.",
     "type": "library",
     "license": "MIT",
     "autoload": {
@@ -63,10 +63,10 @@
             "@tests"
         ],
         "ci": [
-          "@mago",
-          "@tests",
-          "composer audit",
-          "vendor/bin/psalm --taint-analysis"
+            "@mago",
+            "@tests",
+            "composer audit",
+            "vendor/bin/psalm --taint-analysis"
         ]
     },
     "config": {
