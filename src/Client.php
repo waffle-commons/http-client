@@ -6,6 +6,7 @@ namespace Waffle\Commons\HttpClient;
 
 use CurlHandle;
 use CurlMultiHandle;
+use IgorPhp\IgorBundle\Attribute\WorkerSafe;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseFactoryInterface;
@@ -114,6 +115,9 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
      * outbound request, so a distributed trace continues across the service boundary.
      */
     #[\Override]
+    #[WorkerSafe(
+        reason: 'per-call span from the injected tracer, ended in finally; attributes and status go to that span only, nothing survives the call',
+    )]
     public function sendRequest(RequestInterface $request): ResponseInterface
     {
         $span = $this->tracer->startSpan('http.client.request', SpanKind::Client);
