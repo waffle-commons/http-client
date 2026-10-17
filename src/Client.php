@@ -16,6 +16,7 @@ use Psr\Http\Message\StreamInterface;
 use Throwable;
 use Waffle\Commons\Contracts\HttpClient\ConcurrentClientInterface;
 use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
+use Waffle\Commons\Contracts\HttpClient\TimeoutPolicy;
 use Waffle\Commons\Contracts\Telemetry\Enum\SpanKind;
 use Waffle\Commons\Contracts\Telemetry\Enum\SpanStatus;
 use Waffle\Commons\Contracts\Telemetry\NullTextMapPropagator;
@@ -89,6 +90,8 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
 
     private CurlHandle $handle;
 
+    private TimeoutPolicy $timeouts;
+
     private CurlMultiHandle $multiHandle;
 
     /**
@@ -106,8 +109,19 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             throw new HttpClientException('Failed to initialise the underlying cURL handle.');
         }
         $this->handle = $handle;
+        $this->timeouts = new TimeoutPolicy();
         // curl_multi_init() never fails (returns a CurlMultiHandle), so no guard.
         $this->multiHandle = curl_multi_init();
+    }
+
+    /**
+     * A copy using other timeouts ([NET-02], RFC-024 §3.1): the per-request override is an immutable
+     * wither, never mutable client state. The defaults are the former hard ceilings, and the policy
+     * cannot express an infinite timeout.
+     */
+    public function withTimeouts(TimeoutPolicy $timeouts): self
+    {
+        return clone($this, ['timeouts' => $timeouts]);
     }
 
     /**
@@ -437,8 +451,8 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             CURLOPT_CUSTOMREQUEST => $request->getMethod(),
             CURLOPT_HTTP_VERSION => $this->resolveHttpVersion($request->getProtocolVersion()),
             CURLOPT_HTTPHEADER => $this->buildHeaderLines($request),
-            CURLOPT_CONNECTTIMEOUT_MS => self::CONNECT_TIMEOUT_MS,
-            CURLOPT_TIMEOUT_MS => self::TIMEOUT_MS,
+            CURLOPT_CONNECTTIMEOUT_MS => $this->timeouts->connectMs,
+            CURLOPT_TIMEOUT_MS => $this->timeouts->totalMs,
             CURLOPT_NOSIGNAL => true,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,

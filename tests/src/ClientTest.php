@@ -534,4 +534,21 @@ final class ClientTest extends AbstractTestCase
                 return true;
             });
     }
+
+    public function testWithTimeoutsBoundsTheConnectOnACopy(): void
+    {
+        $client = new Client($this->psr17, $this->psr17);
+        $fast = $client->withTimeouts(new \Waffle\Commons\Contracts\HttpClient\TimeoutPolicy(200, 1000));
+        static::assertNotSame($client, $fast);
+
+        $started = hrtime(true);
+        try {
+            // A non-routable address: the transfer ends by the connect timeout or by whatever the local
+            // network stack answers (Docker Desktop intercepts it), never after the 1 s total.
+            $fast->sendRequest($this->psr17->createRequest('GET', 'http://10.255.255.1:81/'));
+            static::fail('The transfer must not succeed.');
+        } catch (\Psr\Http\Client\ClientExceptionInterface) {
+            static::assertLessThan(2.0, (hrtime(true) - $started) / 1_000_000_000);
+        }
+    }
 }

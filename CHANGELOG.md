@@ -5,6 +5,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Released in lockstep with the Waffle Commons umbrella tag.
 
+## [Unreleased]
+
+### Added
+- **Outbound resilience (NET-02, NET-03, RFC-024).** `Client::withTimeouts(TimeoutPolicy)` — per-request timeouts as an immutable wither (defaults = the former ceilings; no infinite timeout can be expressed). `Resilience\RetryingClient` — bounded retries around any PSR-18 client: transport failures and 429/502/503/504, idempotent methods only unless opted in, exponential backoff with full jitter, numeric `Retry-After` honoured beyond the cap within the total budget. `Resilience\CircuitBreakerClient` — a breaker keyed by origin over the shared `CircuitStateStorageInterface`: an open circuit fails fast with `Exception\CircuitOpenException` (503, never retried), transport failures and 5xx count as failures, transitions are published as `CircuitStateChanged` events and metrics (`waffle_circuit_transitions_total`, `waffle_circuit_state`), and an unavailable storage behaves as closed with a warning and `waffle_circuit_storage_errors_total`. Compose as `RetryingClient(CircuitBreakerClient(Client))` so every attempt is checked and re-runs the SSRF guard.
+
+### Dependencies
+- `psr/log` is a direct requirement.
+
 ## [0.1.0-beta6] — 2026-09
 
 **Theme: documentation.**

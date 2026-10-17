@@ -1,0 +1,173 @@
+<?php
+
+declare(strict_types=1);
+
+namespace WaffleTests\Commons\HttpClient\Resilience;
+
+use Nyholm\Psr7\Factory\Psr17Factory;
+use PHPUnit\Framework\Attributes\CoversClass;
+use Psr\Http\Message\RequestInterface;
+use Psr\Log\LoggerInterface;
+use RuntimeException;
+use Waffle\Commons\Contracts\CircuitBreaker\CircuitDecision;
+use Waffle\Commons\Contracts\CircuitBreaker\CircuitStateStorageInterface;
+use Waffle\Commons\Contracts\CircuitBreaker\Enum\CircuitState;
+use Waffle\Commons\Contracts\CircuitBreaker\Event\CircuitStateChanged;
+use Waffle\Commons\Contracts\CircuitBreaker\Exception\CircuitOpenExceptionInterface;
+use Waffle\Commons\Contracts\EventDispatcher\EventDispatcherInterface;
+use Waffle\Commons\Contracts\HttpClient\RetryPolicy;
+use Waffle\Commons\Contracts\RateLimit\Exception\StateStorageExceptionInterface;
+use Waffle\Commons\Contracts\Telemetry\Metrics\MetricsRegistryInterface;
+use Waffle\Commons\HttpClient\Exception\CircuitOpenException;
+use Waffle\Commons\HttpClient\Exception\NetworkException;
+use Waffle\Commons\HttpClient\Resilience\CircuitBreakerClient;
+use Waffle\Commons\HttpClient\Resilience\CircuitObservers;
+use Waffle\Commons\HttpClient\Resilience\RetryingClient;
+use WaffleTests\Commons\HttpClient\AbstractTestCase;
+
+#[CoversClass(CircuitBreakerClient::class)]
+#[CoversClass(CircuitObservers::class)]
+#[CoversClass(CircuitOpenException::class)]
+final class CircuitBreakerClientTest extends AbstractTestCase
+{
+    public function testAClosedCircuitLetsTheCallThroughAndRecordsASuccess(): void
+    {
+        $storage = $this->createMock(CircuitStateStorageInterface::class);
+        $storage
+            ->expects($this->once())
+            ->method('acquire')
+            ->with('https://api.example.com:443')
+            ->willReturn(new CircuitDecision(true, CircuitState::Closed));
+        $storage
+            ->expects($this->once())
+            ->method('record')
+            ->with('https://api.example.com:443', $this->anything(), true)
+            ->willReturn(new CircuitDecision(true, CircuitState::Closed));
+        $inner = new ScriptedClient([new Psr17Factory()->createResponse(200)]);
+
+        static::assertSame(
+            200,
+            new CircuitBreakerClient($inner, $storage)
+                ->sendRequest(self::request())
+                ->getStatusCode(),
+        );
+    }
+
+    public function testAnOpenCircuitFailsFastWithA503(): void
+    {
+        $storage = $this->createStub(CircuitStateStorageInterface::class);
+        $storage->method('acquire')->willReturn(new CircuitDecision(false, CircuitState::Open));
+        $inner = new ScriptedClient([]);
+
+        try {
+            new CircuitBreakerClient($inner, $storage)->sendRequest(self::request());
+            static::fail('The open circuit must refuse the call.');
+        } catch (CircuitOpenExceptionInterface $e) {
+            static::assertSame(503, $e->getCode());
+            static::assertSame(0, $inner->calls);
+        }
+    }
+
+    public function testATransportFailureIsRecordedThenRethrown(): void
+    {
+        $storage = $this->createMock(CircuitStateStorageInterface::class);
+        $storage->method('acquire')->willReturn(new CircuitDecision(true, CircuitState::Closed));
+        $storage
+            ->expects($this->once())
+            ->method('record')
+            ->with($this->anything(), $this->anything(), false)
+            ->willReturn(new CircuitDecision(true, CircuitState::Closed));
+        $inner = new ScriptedClient([new NetworkException(self::request(), 'Connection refused')]);
+
+        $this->expectException(NetworkException::class);
+
+        new CircuitBreakerClient($inner, $storage)->sendRequest(self::request());
+    }
+
+    public function testAServerErrorCountsAsAFailureAndATransitionIsPublished(): void
+    {
+        $storage = $this->createStub(CircuitStateStorageInterface::class);
+        $storage->method('acquire')->willReturn(new CircuitDecision(true, CircuitState::Closed));
+        $storage->method('record')->willReturn(new CircuitDecision(true, CircuitState::Open, CircuitState::Closed));
+        $events = $this->createMock(EventDispatcherInterface::class);
+        $events
+            ->expects($this->once())
+            ->method('dispatch')
+            ->with($this->callback(
+                static fn(object $event): bool => (
+                    $event instanceof CircuitStateChanged
+                    && $event->from === CircuitState::Closed
+                    && $event->to === CircuitState::Open
+                    && $event->circuit === 'https://api.example.com:443'
+                ),
+            ))
+            ->willReturnArgument(0);
+        $metrics = $this->createMock(MetricsRegistryInterface::class);
+        $metrics->expects($this->once())->method('increment')->with(CircuitBreakerClient::TRANSITIONS_METRIC, 1.0, [
+            'circuit' => 'https://api.example.com:443',
+            'to' => 'open',
+        ]);
+        $metrics->expects($this->exactly(2))->method('gauge');
+        $inner = new ScriptedClient([new Psr17Factory()->createResponse(500)]);
+
+        $client = new CircuitBreakerClient($inner, $storage, observers: new CircuitObservers($events, $metrics));
+
+        static::assertSame(500, $client->sendRequest(self::request())->getStatusCode());
+    }
+
+    public function testAnUnavailableStorageBehavesAsClosed(): void
+    {
+        $outage = new class('Connection refused') extends RuntimeException implements StateStorageExceptionInterface {};
+        $storage = $this->createStub(CircuitStateStorageInterface::class);
+        $storage->method('acquire')->willThrowException($outage);
+        $storage->method('record')->willThrowException($outage);
+        $metrics = $this->createMock(MetricsRegistryInterface::class);
+        $metrics
+            ->expects($this->exactly(2))
+            ->method('increment')
+            ->with(CircuitBreakerClient::STORAGE_ERRORS_METRIC, 1.0, ['circuit' => 'http://legacy.internal:8080']);
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->exactly(2))->method('warning');
+        $inner = new ScriptedClient([new Psr17Factory()->createResponse(200)]);
+
+        $client = new CircuitBreakerClient($inner, $storage, observers: new CircuitObservers(null, $metrics, $logger));
+        $response = $client->sendRequest(new Psr17Factory()->createRequest('GET', 'http://legacy.internal:8080/x'));
+
+        static::assertSame(200, $response->getStatusCode());
+        static::assertSame(1, $inner->calls);
+    }
+
+    public function testAnOpenCircuitIsNeverRetried(): void
+    {
+        $storage = $this->createStub(CircuitStateStorageInterface::class);
+        $storage->method('acquire')->willReturn(new CircuitDecision(false, CircuitState::Open));
+        $inner = new ScriptedClient([]);
+        $client = new RetryingClient(new CircuitBreakerClient($inner, $storage), new RetryPolicy(5, 1, 1, 10_000));
+
+        $this->expectException(CircuitOpenExceptionInterface::class);
+
+        $client->sendRequest(self::request());
+    }
+
+    public function testTheCircuitKeyDefaultsThePortFromTheScheme(): void
+    {
+        $storage = $this->createMock(CircuitStateStorageInterface::class);
+        $storage
+            ->expects($this->once())
+            ->method('acquire')
+            ->with('http://example.com:80')
+            ->willReturn(new CircuitDecision(false, CircuitState::Open));
+
+        $this->expectException(CircuitOpenException::class);
+
+        new CircuitBreakerClient(new ScriptedClient([]), $storage)->sendRequest(new Psr17Factory()->createRequest(
+            'GET',
+            '//example.com/',
+        ));
+    }
+
+    private static function request(): RequestInterface
+    {
+        return new Psr17Factory()->createRequest('GET', 'https://api.example.com/orders');
+    }
+}
