@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Waffle\Commons\HttpClient\Resilience;
 
+use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Client\NetworkExceptionInterface;
 use Psr\Http\Message\RequestInterface;
@@ -13,8 +14,10 @@ use Waffle\Commons\Contracts\CircuitBreaker\CircuitDecision;
 use Waffle\Commons\Contracts\CircuitBreaker\CircuitStateStorageInterface;
 use Waffle\Commons\Contracts\CircuitBreaker\Enum\CircuitState;
 use Waffle\Commons\Contracts\CircuitBreaker\Event\CircuitStateChanged;
+use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
 use Waffle\Commons\Contracts\RateLimit\Exception\StateStorageExceptionInterface;
 use Waffle\Commons\HttpClient\Exception\CircuitOpenException;
+use Waffle\Commons\HttpClient\SettlingClientInterface;
 
 /**
  * A circuit breaker around any PSR-18 client ([NET-03], RFC-024 §3.2). Stateless: the circuit lives in the
@@ -24,8 +27,12 @@ use Waffle\Commons\HttpClient\Exception\CircuitOpenException;
  * failure or a 5xx response counts as a failure. When the storage itself is unavailable, the breaker
  * behaves as closed, with a warning and a metric (RFC-024 §5.2). Put it inside a {@see RetryingClient} so
  * every attempt is checked.
+ *
+ * The concurrent path checks every request's circuit before any of them is sent, then sends the admitted
+ * ones together (RFC-024 §3.3): a refused request settles as its {@see CircuitOpenException}, and a promise
+ * runs the whole check when it is waited on.
  */
-final readonly class CircuitBreakerClient implements ClientInterface
+final readonly class CircuitBreakerClient implements ClientInterface, SettlingClientInterface
 {
     public const string TRANSITIONS_METRIC = 'waffle_circuit_transitions_total';
 
@@ -47,28 +54,97 @@ final readonly class CircuitBreakerClient implements ClientInterface
     public function sendRequest(RequestInterface $request): ResponseInterface
     {
         $circuit = self::circuitOf($request);
+        if (!$this->admits($circuit)) {
+            throw CircuitOpenException::for($circuit);
+        }
 
+        $outcome = Settlement::one($this->inner, $request);
+        $this->recordOutcome($circuit, $outcome);
+
+        return Settlement::unwrap($outcome);
+    }
+
+    /**
+     * @param array<array-key, RequestInterface> $requests
+     *
+     * @return array<array-key, ResponseInterface>
+     *
+     * @throws ClientExceptionInterface The first failure in key order, once every request has settled.
+     */
+    #[\Override]
+    public function sendRequests(array $requests): array
+    {
+        return Settlement::responsesOrThrow($this->settleRequests($requests));
+    }
+
+    /**
+     * @param array<array-key, RequestInterface> $requests
+     *
+     * @return array<array-key, ResponseInterface|ClientExceptionInterface>
+     */
+    #[\Override]
+    public function settleRequests(array $requests): array
+    {
+        $admitted = [];
+        foreach ($requests as $key => $request) {
+            if (!$this->admits(self::circuitOf($request))) {
+                continue;
+            }
+
+            $admitted[$key] = $request;
+        }
+
+        $sent = Settlement::through($this->inner, $admitted);
+
+        $outcomes = [];
+        foreach ($requests as $key => $request) {
+            $circuit = self::circuitOf($request);
+            if (!array_key_exists($key, $admitted)) {
+                $outcomes[$key] = CircuitOpenException::for($circuit);
+                continue;
+            }
+
+            $outcome = $sent[$key] ?? Settlement::unsettled($request);
+            $this->recordOutcome($circuit, $outcome);
+            $outcomes[$key] = $outcome;
+        }
+
+        return $outcomes;
+    }
+
+    #[\Override]
+    public function promise(RequestInterface $request): PromiseInterface
+    {
+        return Settlement::deferred($this, $request);
+    }
+
+    /** Whether the circuit lets a call through now; an unavailable storage lets it through. */
+    private function admits(string $circuit): bool
+    {
         try {
             $permission = $this->storage->acquire($circuit, $this->policy);
-            $this->observe($circuit, $permission);
-            if (!$permission->allowed) {
-                throw CircuitOpenException::for($circuit);
-            }
         } catch (StateStorageExceptionInterface $e) {
             $this->storageUnavailable($circuit, $e);
+
+            return true;
         }
 
-        try {
-            $response = $this->inner->sendRequest($request);
-        } catch (NetworkExceptionInterface $failure) {
+        $this->observe($circuit, $permission);
+
+        return $permission->allowed;
+    }
+
+    /**
+     * A response below 500 is a success and a transport failure is a failure. Any other client failure (an
+     * SSRF refusal, a malformed request) says nothing about the upstream and is not counted.
+     */
+    private function recordOutcome(string $circuit, ResponseInterface|ClientExceptionInterface $outcome): void
+    {
+        if ($outcome instanceof ResponseInterface) {
+            $this->record($circuit, $outcome->getStatusCode() < 500);
+        } elseif ($outcome instanceof NetworkExceptionInterface) {
             $this->record($circuit, false);
-
-            throw $failure;
         }
-
-        $this->record($circuit, $response->getStatusCode() < 500);
-
-        return $response;
     }
 
     private function record(string $circuit, bool $success): void

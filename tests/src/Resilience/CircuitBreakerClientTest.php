@@ -7,6 +7,7 @@ namespace WaffleTests\Commons\HttpClient\Resilience;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use PHPUnit\Framework\Attributes\CoversClass;
 use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
 use Psr\Log\LoggerInterface;
 use RuntimeException;
 use Waffle\Commons\Contracts\CircuitBreaker\CircuitDecision;
@@ -20,6 +21,8 @@ use Waffle\Commons\Contracts\RateLimit\Exception\StateStorageExceptionInterface;
 use Waffle\Commons\Contracts\Telemetry\Metrics\MetricsRegistryInterface;
 use Waffle\Commons\HttpClient\Exception\CircuitOpenException;
 use Waffle\Commons\HttpClient\Exception\NetworkException;
+use Waffle\Commons\HttpClient\Exception\RequestException;
+use Waffle\Commons\HttpClient\Exception\SsrfException;
 use Waffle\Commons\HttpClient\Resilience\CircuitBreakerClient;
 use Waffle\Commons\HttpClient\Resilience\CircuitObservers;
 use Waffle\Commons\HttpClient\Resilience\RetryingClient;
@@ -166,8 +169,141 @@ final class CircuitBreakerClientTest extends AbstractTestCase
         ));
     }
 
+    public function testABatchSendsTheAdmittedRequestsTogetherAndSettlesTheRefusedOnes(): void
+    {
+        $storage = new RecordingCircuitStorage(['https://b.example.com:443']);
+        $inner = new ScriptedSettlingClient([
+            'https://a.example.com/' => [self::response(200)],
+            'https://c.example.com/' => [self::response(200)],
+        ]);
+
+        $outcomes = new CircuitBreakerClient($inner, $storage)->settleRequests([
+            'a' => self::requestTo('https://a.example.com/'),
+            'b' => self::requestTo('https://b.example.com/'),
+            'c' => self::requestTo('https://c.example.com/'),
+        ]);
+
+        static::assertSame(['a', 'b', 'c'], array_keys($outcomes));
+        static::assertInstanceOf(CircuitOpenException::class, $outcomes['b'] ?? null);
+        static::assertSame(503, $outcomes['b']->getCode());
+        static::assertSame([['https://a.example.com/', 'https://c.example.com/']], $inner->batches);
+    }
+
+    public function testEveryOutcomeOfABatchIsRecordedExceptTheOnesThatSayNothingAboutTheUpstream(): void
+    {
+        $storage = new RecordingCircuitStorage();
+        $inner = new ScriptedSettlingClient([
+            'https://a.example.com/' => [self::response(404)],
+            'https://b.example.com/' => [self::response(502)],
+            'https://c.example.com/' => [new NetworkException(self::requestTo('https://c.example.com/'), 'Timeout')],
+            'https://d.example.com/' => [new SsrfException(self::requestTo('https://d.example.com/'), 'Private')],
+        ]);
+
+        new CircuitBreakerClient($inner, $storage)->settleRequests([
+            self::requestTo('https://a.example.com/'),
+            self::requestTo('https://b.example.com/'),
+            self::requestTo('https://c.example.com/'),
+            self::requestTo('https://d.example.com/'),
+        ]);
+
+        static::assertSame(
+            [
+                ['https://a.example.com:443', true],
+                ['https://b.example.com:443', false],
+                ['https://c.example.com:443', false],
+            ],
+            $storage->recorded,
+        );
+    }
+
+    public function testAFailFastBatchThrowsTheFirstFailureOnceEveryRequestSettled(): void
+    {
+        $storage = new RecordingCircuitStorage(['https://b.example.com:443']);
+        $inner = new ScriptedSettlingClient([
+            'https://a.example.com/' => [self::response(200)],
+            'https://c.example.com/' => [self::response(500)],
+        ]);
+
+        try {
+            new CircuitBreakerClient($inner, $storage)->sendRequests([
+                self::requestTo('https://a.example.com/'),
+                self::requestTo('https://b.example.com/'),
+                self::requestTo('https://c.example.com/'),
+            ]);
+            static::fail('The refused request must fail the batch.');
+        } catch (CircuitOpenExceptionInterface $e) {
+            static::assertStringContainsString('https://b.example.com:443', $e->getMessage());
+        }
+
+        static::assertSame(
+            [
+                ['https://a.example.com:443', true],
+                ['https://c.example.com:443', false],
+            ],
+            $storage->recorded,
+        );
+    }
+
+    public function testAFailFastBatchReturnsEveryResponseWhenNothingFailed(): void
+    {
+        $inner = new ScriptedSettlingClient([
+            'https://a.example.com/' => [self::response(200)],
+            'https://b.example.com/' => [self::response(201)],
+        ]);
+
+        $responses = new CircuitBreakerClient($inner, new RecordingCircuitStorage())->sendRequests([
+            'a' => self::requestTo('https://a.example.com/'),
+            'b' => self::requestTo('https://b.example.com/'),
+        ]);
+
+        static::assertSame(['a', 'b'], array_keys($responses));
+        static::assertSame(201, ($responses['b'] ?? self::response(500))->getStatusCode());
+    }
+
+    public function testAnOutcomeTheInnerClientForgotIsAFailureThatIsNotRecorded(): void
+    {
+        $storage = new RecordingCircuitStorage();
+        $inner = new ScriptedSettlingClient(['https://a.example.com/' => [self::response(200)]], forget: ['b']);
+
+        $outcomes = new CircuitBreakerClient($inner, $storage)->settleRequests([
+            'a' => self::requestTo('https://a.example.com/'),
+            'b' => self::requestTo('https://b.example.com/'),
+        ]);
+
+        static::assertInstanceOf(RequestException::class, $outcomes['b'] ?? null);
+        static::assertSame([['https://a.example.com:443', true]], $storage->recorded);
+    }
+
+    public function testAPromiseChecksTheCircuitOnlyWhenItIsWaitedOn(): void
+    {
+        $storage = new RecordingCircuitStorage(['https://api.example.com:443']);
+        $inner = new ScriptedClient([]);
+
+        $promise = new CircuitBreakerClient($inner, $storage)->promise(self::request());
+        $acquiredBeforeWait = $storage->acquired;
+
+        try {
+            $promise->wait();
+            static::fail('The open circuit must reject the promise.');
+        } catch (CircuitOpenExceptionInterface) {
+            static::assertSame([], $acquiredBeforeWait);
+            static::assertSame(['https://api.example.com:443'], $storage->acquired);
+            static::assertSame(0, $inner->calls);
+        }
+    }
+
     private static function request(): RequestInterface
     {
         return new Psr17Factory()->createRequest('GET', 'https://api.example.com/orders');
+    }
+
+    private static function requestTo(string $uri): RequestInterface
+    {
+        return new Psr17Factory()->createRequest('GET', $uri);
+    }
+
+    private static function response(int $status): ResponseInterface
+    {
+        return new Psr17Factory()->createResponse($status);
     }
 }
