@@ -504,6 +504,19 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             }
         } while ($running > 0 && $status === CURLM_OK);
 
+        // PHP copies a finished transfer's CURLcode into its easy handle only when
+        // the handle's completion message is read. Without this drain, curl_errno()
+        // answers 0 for a failed transfer, and a dead upstream reads as "no status
+        // line" (a RequestException) instead of the NetworkException that the
+        // retry policy retries and the circuit breaker counts. The count of messages
+        // still queued comes back through a by-ref out-parameter the stubs leave
+        // untyped: it stays in an array slot and is cast in place (an int, or null
+        // when the queue was already empty).
+        $queued = [0];
+        do {
+            curl_multi_info_read($multiHandle, $queued[0]);
+        } while ((int) $queued[0] > 0);
+
         return $status;
     }
 
