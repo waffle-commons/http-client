@@ -15,9 +15,9 @@ use Waffle\Commons\Contracts\CircuitBreaker\CircuitStateStorageInterface;
 use Waffle\Commons\Contracts\CircuitBreaker\Enum\CircuitState;
 use Waffle\Commons\Contracts\CircuitBreaker\Event\CircuitStateChanged;
 use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
+use Waffle\Commons\Contracts\HttpClient\SettlingClientInterface;
 use Waffle\Commons\Contracts\RateLimit\Exception\StateStorageExceptionInterface;
 use Waffle\Commons\HttpClient\Exception\CircuitOpenException;
-use Waffle\Commons\HttpClient\SettlingClientInterface;
 
 /**
  * A circuit breaker around any PSR-18 client ([NET-03], RFC-024 §3.2). Stateless: the circuit lives in the

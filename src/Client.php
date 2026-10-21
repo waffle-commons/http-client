@@ -17,6 +17,7 @@ use Psr\Http\Message\StreamInterface;
 use Throwable;
 use Waffle\Commons\Contracts\HttpClient\ConcurrentClientInterface;
 use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
+use Waffle\Commons\Contracts\HttpClient\SettlingClientInterface;
 use Waffle\Commons\Contracts\HttpClient\TimeoutPolicy;
 use Waffle\Commons\Contracts\Telemetry\Enum\SpanKind;
 use Waffle\Commons\Contracts\Telemetry\Enum\SpanStatus;

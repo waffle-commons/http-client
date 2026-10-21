@@ -7,6 +7,7 @@ namespace WaffleTests\Commons\HttpClient\Security;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
+use Waffle\Commons\HttpClient\Exception\NetworkException;
 use Waffle\Commons\HttpClient\Exception\SsrfException;
 use Waffle\Commons\HttpClient\Security\HostResolverInterface;
 use Waffle\Commons\HttpClient\Security\SsrfGuard;
@@ -72,14 +73,19 @@ final class SsrfGuardTest extends TestCase
         $guard->resolvePins($request);
     }
 
-    public function testUnresolvableHostIsRejected(): void
+    public function testAnUnresolvableHostIsANetworkFailureNotARefusal(): void
     {
         $guard = $this->guardResolving([]);
         $request = $this->psr17->createRequest('GET', 'https://ghost.example.com/');
 
-        $this->expectException(SsrfException::class);
-        $this->expectExceptionMessage('could not be resolved');
-        $guard->resolvePins($request);
+        try {
+            $guard->resolvePins($request);
+            static::fail('An unresolvable host must fail.');
+        } catch (NetworkException $e) {
+            static::assertSame(CURLE_COULDNT_RESOLVE_HOST, $e->getCode());
+            static::assertStringContainsString('could not be resolved', $e->getMessage());
+            static::assertSame($request, $e->getRequest());
+        }
     }
 
     public function testMissingHostIsRejected(): void

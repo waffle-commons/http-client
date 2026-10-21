@@ -9,9 +9,9 @@ use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
+use Waffle\Commons\Contracts\HttpClient\SettlingClientInterface;
 use Waffle\Commons\HttpClient\Exception\RequestException;
 use Waffle\Commons\HttpClient\Promise\Promise;
-use Waffle\Commons\HttpClient\SettlingClientInterface;
 
 /**
  * How the resilience decorators settle requests ([NET-02], [NET-03], RFC-024 §3.3): every request ends with

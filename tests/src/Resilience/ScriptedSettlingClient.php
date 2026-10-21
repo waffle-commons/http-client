@@ -10,7 +10,7 @@ use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
-use Waffle\Commons\HttpClient\SettlingClientInterface;
+use Waffle\Commons\Contracts\HttpClient\SettlingClientInterface;
 
 /**
  * A settling client that plays back scripted outcomes per request URI, in order. It records the URIs of

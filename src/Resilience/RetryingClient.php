@@ -12,7 +12,7 @@ use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
 use Waffle\Commons\Contracts\HttpClient\RetryPolicy;
-use Waffle\Commons\HttpClient\SettlingClientInterface;
+use Waffle\Commons\Contracts\HttpClient\SettlingClientInterface;
 
 /**
  * Bounded retries around any PSR-18 client ([NET-02], RFC-024 §3.1, §3.3). Stateless.

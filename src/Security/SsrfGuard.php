@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Waffle\Commons\HttpClient\Security;
 
 use Psr\Http\Message\RequestInterface;
+use Waffle\Commons\HttpClient\Exception\NetworkException;
 use Waffle\Commons\HttpClient\Exception\SsrfException;
 use Waffle\Commons\Utils\Assert;
 
@@ -51,8 +52,11 @@ final readonly class SsrfGuard
      *         Empty for a literal-IP host — there is no DNS step to pin and the
      *         literal has already been validated.
      *
-     * @throws SsrfException When the host is missing, unresolvable, or resolves
-     *         to a non-public address.
+     * @throws SsrfException When the host is missing or resolves to a non-public
+     *         address: a refusal.
+     * @throws NetworkException When the host does not resolve: a transport
+     *         failure, as cURL reports it for a host it resolves itself, so the
+     *         retry policy retries it and the circuit breaker counts it.
      */
     public function resolvePins(RequestInterface $request): array
     {
@@ -71,7 +75,12 @@ final readonly class SsrfGuard
 
         $addresses = $isLiteral ? [$bareHost] : $this->resolver->resolve($host);
         if ($addresses === []) {
-            throw new SsrfException($request, sprintf('Host "%s" could not be resolved.', $host));
+            // Nothing to vet and nothing is sent: an outage of the name, not a refusal.
+            throw new NetworkException(
+                $request,
+                sprintf('Host "%s" could not be resolved.', $host),
+                CURLE_COULDNT_RESOLVE_HOST,
+            );
         }
 
         foreach ($addresses as $address) {
