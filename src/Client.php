@@ -7,6 +7,7 @@ namespace Waffle\Commons\HttpClient;
 use CurlHandle;
 use CurlMultiHandle;
 use IgorPhp\IgorBundle\Attribute\WorkerSafe;
+use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseFactoryInterface;
@@ -49,6 +50,8 @@ use Waffle\Commons\HttpClient\Security\SsrfGuard;
  * handle and drives one shared `curl_multi_exec()` loop, so N requests complete
  * in roughly the wall-clock of the slowest one. {@see self::promise()} hands the
  * caller a non-blocking {@see PromiseInterface} over a single in-flight request.
+ * {@see self::settleRequests()} runs the same fan-out but settles every request
+ * instead of throwing the first failure, which the resilience decorators build on.
  * Per-request handles are created and closed within the call — the only resident
  * state is the persistent easy/multi handle, so the client stays worker-safe.
  *
@@ -67,7 +70,7 @@ use Waffle\Commons\HttpClient\Security\SsrfGuard;
  * Connect and total timeouts are hardcoded ceilings (1s / 10s) and cannot be
  * raised by callers — a hung legacy backend must never lock a worker thread.
  */
-final readonly class Client implements ClientInterface, ConcurrentClientInterface
+final readonly class Client implements ClientInterface, ConcurrentClientInterface, SettlingClientInterface
 {
     /** Maximum time to establish a TCP/TLS connection (ms). */
     public const int CONNECT_TIMEOUT_MS = 1000;
@@ -214,6 +217,59 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             // In PHP 8.x a CurlHandle is a GC-managed object (curl_close is a
             // deprecated no-op), so dropping the last reference releases it — no
             // per-request state survives the call.
+            foreach ($transfers as $transfer) {
+                curl_multi_remove_handle($multiHandle, $transfer->handle);
+            }
+            curl_multi_close($multiHandle);
+        }
+    }
+
+    /**
+     * Resolve several requests concurrently, like {@see self::sendRequests()},
+     * but settle each one: every key maps to its response or to the exception its
+     * transfer failed with, and nothing is thrown ([NET-02], RFC-024 §3.3). A
+     * request the SSRF guard refuses settles as its {@see \Waffle\Commons\HttpClient\Exception\SsrfException}
+     * and is never sent, while the rest of the batch runs.
+     *
+     * @param array<array-key, RequestInterface> $requests
+     *
+     * @return array<array-key, ResponseInterface|ClientExceptionInterface>
+     */
+    #[\Override]
+    public function settleRequests(array $requests): array
+    {
+        // An empty batch drives an empty multi handle, which settles at once.
+        $multiHandle = curl_multi_init();
+
+        // One slot per request, in the batch's key order: its transfer, or the
+        // failure that kept it from being prepared.
+        /** @var array<array-key, Transfer|ClientExceptionInterface> $slots */
+        $slots = [];
+        /** @var list<Transfer> $transfers */
+        $transfers = [];
+        try {
+            foreach ($requests as $key => $request) {
+                try {
+                    $transfer = $this->prepareTransfer($this->injectTraceContext($request));
+                } catch (ClientExceptionInterface $refused) {
+                    $slots[$key] = $refused;
+                    continue;
+                }
+
+                curl_multi_add_handle($multiHandle, $transfer->handle);
+                $slots[$key] = $transfer;
+                $transfers[] = $transfer;
+            }
+
+            $status = $this->drive($multiHandle);
+
+            $outcomes = [];
+            foreach ($slots as $key => $slot) {
+                $outcomes[$key] = $slot instanceof Transfer ? $this->outcomeOf($slot, $status) : $slot;
+            }
+
+            return $outcomes;
+        } finally {
             foreach ($transfers as $transfer) {
                 curl_multi_remove_handle($multiHandle, $transfer->handle);
             }
@@ -373,6 +429,23 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
         }
 
         return $this->buildResponse($transfer->statusLine, $transfer->headers, $transfer->body);
+    }
+
+    /**
+     * A driven transfer's response, or the failure it settled with: a broken
+     * multi loop fails every transfer of the batch (ASYNC02-01).
+     */
+    private function outcomeOf(Transfer $transfer, int $status): ResponseInterface|ClientExceptionInterface
+    {
+        if ($status !== CURLM_OK) {
+            return $this->mapMultiError($transfer->request, $status);
+        }
+
+        try {
+            return $this->finishTransfer($transfer);
+        } catch (ClientExceptionInterface $failure) {
+            return $failure;
+        }
     }
 
     /**
