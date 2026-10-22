@@ -231,6 +231,34 @@ final class ClientTest extends AbstractTestCase
         self::assertArrayNotHasKey(CURLOPT_POSTFIELDS, $this->capturedScalarOptions);
     }
 
+    public function testAnUnsizedBodyGoesOutWithItsDeclaredLengthAndOneFraming(): void
+    {
+        $this->primeSuccessfulExchange(["HTTP/1.1 201 Created\r\n", "\r\n"], []);
+        $this->mockCurlSetoptCapturingOption();
+
+        // php://input in a FrankenPHP worker: no size of its own, a Content-Length from the client that
+        // sent it. Chunking it while that header went out too made nginx answer 400 (EcoShield, GATE-02).
+        $stream = $this->createStub(StreamInterface::class);
+        $stream->method('getSize')->willReturn(null);
+        $stream->method('isSeekable')->willReturn(false);
+
+        $request = $this->psr17
+            ->createRequest('POST', 'https://example.com/orders')
+            ->withHeader('Content-Length', '11')
+            ->withHeader('Content-Type', 'application/json')
+            ->withBody($stream);
+        $this->dispatch($request);
+
+        self::assertTrue($this->capturedScalarOptions[CURLOPT_UPLOAD] ?? null);
+        self::assertSame(11, $this->capturedScalarOptions[CURLOPT_INFILESIZE] ?? null);
+
+        /** @var list<string> $sent */
+        $sent = $this->capturedOptions[CURLOPT_HTTPHEADER];
+        self::assertContains('Content-Type: application/json', $sent);
+        // libcurl writes the one Content-Length itself, from CURLOPT_INFILESIZE.
+        self::assertSame([], preg_grep('/^(content-length|transfer-encoding):/i', $sent));
+    }
+
     public function testEmptyRequestBodyDoesNotStream(): void
     {
         $this->primeSuccessfulExchange(["HTTP/1.1 200 OK\r\n", "\r\n"], []);

@@ -540,11 +540,14 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
         string &$statusLine,
         array &$headers,
     ): void {
+        // One framing for the whole message: the length below decides both the upload and the headers.
+        $length = RequestFraming::bodyLength($request);
+
         $options = [
             CURLOPT_URL => (string) $request->getUri(),
             CURLOPT_CUSTOMREQUEST => $request->getMethod(),
             CURLOPT_HTTP_VERSION => $this->resolveHttpVersion($request->getProtocolVersion()),
-            CURLOPT_HTTPHEADER => $this->buildHeaderLines($request),
+            CURLOPT_HTTPHEADER => RequestFraming::headerLines($request, $length),
             CURLOPT_CONNECTTIMEOUT_MS => $this->timeouts->connectMs,
             CURLOPT_TIMEOUT_MS => $this->timeouts->totalMs,
             CURLOPT_NOSIGNAL => true,
@@ -579,7 +582,7 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
 
         curl_setopt_array($handle, $options);
 
-        $this->applyRequestBody($handle, $request);
+        $this->applyRequestBody($handle, $request, $length);
     }
 
     /**
@@ -592,20 +595,18 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
      * `CURLOPT_CUSTOMREQUEST` is preserved; `CURLOPT_UPLOAD` only switches on the
      * read-callback transfer mode, it does not override the method line.
      *
-     * When the body length is known it is advertised via `CURLOPT_INFILESIZE`
-     * (Content-Length); when it is not (`getSize() === null`), libcurl falls back
-     * to `Transfer-Encoding: chunked`.
+     * When the body length is known ({@see RequestFraming::bodyLength()}) it is advertised
+     * via `CURLOPT_INFILESIZE` (Content-Length); when it is not, libcurl falls back to
+     * `Transfer-Encoding: chunked`.
      */
-    private function applyRequestBody(CurlHandle $handle, RequestInterface $request): void
+    private function applyRequestBody(CurlHandle $handle, RequestInterface $request, ?int $length): void
     {
-        $stream = $request->getBody();
-        $size = $stream->getSize();
-
         // No body to forward (typical GET/DELETE/HEAD): leave the handle as-is.
-        if ($size === 0) {
+        if ($length === 0) {
             return;
         }
 
+        $stream = $request->getBody();
         if ($stream->isSeekable()) {
             $stream->rewind();
         }
@@ -625,8 +626,8 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             },
         );
 
-        if ($size !== null) {
-            curl_setopt($handle, CURLOPT_INFILESIZE, $size);
+        if ($length !== null) {
+            curl_setopt($handle, CURLOPT_INFILESIZE, $length);
         }
     }
 
@@ -696,20 +697,6 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
         $reason = $parts[2] ?? '';
 
         return [$version, $code, $reason];
-    }
-
-    /**
-     * @return list<string>
-     */
-    private function buildHeaderLines(RequestInterface $request): array
-    {
-        $lines = [];
-        foreach ($request->getHeaders() as $name => $values) {
-            foreach ($values as $value) {
-                $lines[] = $name . ': ' . $value;
-            }
-        }
-        return $lines;
     }
 
     private function resolveHttpVersion(string $protocolVersion): int
