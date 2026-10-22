@@ -211,6 +211,27 @@ final class ClientTest extends AbstractTestCase
         self::assertSame('', $read($handle, null, Client::CHUNK_SIZE));
     }
 
+    public function testABodyAlreadyReadToItsEndIsUploadedFromItsStart(): void
+    {
+        $payload = '{"order":42}';
+        $this->primeSuccessfulExchange(["HTTP/1.1 201 Created\r\n", "\r\n"], []);
+        $this->mockCurlSetoptCapturingOption();
+
+        // A retry hands the transport the same stream its first attempt read to the end, and a request
+        // factory may have read it already to parse it. A seekable body goes out from its first byte.
+        $body = $this->psr17->createStream($payload);
+        $body->getContents();
+        self::assertSame(strlen($payload), $body->tell());
+
+        $this->dispatch($this->psr17->createRequest('PUT', 'https://example.com/orders/42')->withBody($body));
+
+        $read = $this->capturedScalarOptions[CURLOPT_READFUNCTION] ?? null;
+        self::assertInstanceOf(Closure::class, $read);
+        $handle = $this->capturedHandle;
+        self::assertInstanceOf(CurlHandle::class, $handle);
+        self::assertSame($payload, $read($handle, null, Client::CHUNK_SIZE));
+    }
+
     public function testRequestBodyWithUnknownLengthUsesChunkedUpload(): void
     {
         $this->primeSuccessfulExchange(["HTTP/1.1 200 OK\r\n", "\r\n"], []);
