@@ -68,15 +68,22 @@ use Waffle\Commons\HttpClient\Security\SsrfGuard;
  * and the vetted IP is pinned via `CURLOPT_RESOLVE` before the transfer — the
  * transport can never connect to an internal address, even under DNS rebinding.
  *
- * Connect and total timeouts are hardcoded ceilings (1s / 10s) and cannot be
- * raised by callers — a hung legacy backend must never lock a worker thread.
+ * Connect and total timeouts come from a {@see TimeoutPolicy} — 1 s / 10 s unless
+ * {@see self::withTimeouts()} returns a copy with another one ([NET-02]). The policy
+ * cannot express an infinite timeout, so a hung legacy backend never locks a worker thread.
  */
 final readonly class Client implements ClientInterface, ConcurrentClientInterface, SettlingClientInterface
 {
-    /** Maximum time to establish a TCP/TLS connection (ms). */
+    /**
+     * The former connect ceiling (ms). The client no longer reads it: {@see TimeoutPolicy::DEFAULT_CONNECT_MS}
+     * replaced it in 0.1.0-beta7; a candidate for the beta8 deprecation pass.
+     */
     public const int CONNECT_TIMEOUT_MS = 1000;
 
-    /** Maximum total time for a single request, including transfer (ms). */
+    /**
+     * The former total ceiling (ms). The client no longer reads it: {@see TimeoutPolicy::DEFAULT_TOTAL_MS}
+     * replaced it in 0.1.0-beta7; a candidate for the beta8 deprecation pass.
+     */
     public const int TIMEOUT_MS = 10_000;
 
     /** Body streaming chunk size (bytes), used for both upload and download. */
