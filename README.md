@@ -15,15 +15,22 @@ Waffle HTTP Client Component
 
 A high-performance PSR-18 HTTP client tuned for FrankenPHP resident-worker proxying. Holds a single persistent `\CurlHandle` **plus** a `\CurlMultiHandle`, reused via `curl_reset()` across every `sendRequest()` so libcurl's DNS cache and keep-alive pool stay warm. The transfer is driven through the multi interface, so the worker parks on `curl_multi_select()` (a socket-level wait) instead of blocking inside `curl_exec()`. Bodies stream in 8 KiB chunks **in both directions** — request bodies are *pulled* from the PSR-7 request stream and response bodies are *pushed* into a PSR-7 stream — so neither side is ever materialised whole in worker memory.
 
-## Beta-2 status
+## 🆕 Beta-7 — outbound resilience (NET-02, NET-03)
 
-No behavioural changes since Beta-1 — lockstep version bump only. The client surface, security defaults, and streaming guarantees remain as described below.
+- **Bounded timeouts.** `Client::withTimeouts(TimeoutPolicy)` returns a client with per-request timeouts (an immutable wither). The defaults are the former ceilings, and no infinite timeout can be expressed.
+- **Retries.** `Resilience\RetryingClient` wraps any PSR-18 client. It retries transport failures and `429` / `502` / `503` / `504`, idempotent methods only unless opted in, with exponential backoff and full jitter, and honours a numeric `Retry-After` beyond the cap within the total budget.
+- **Circuit breaker.** `Resilience\CircuitBreakerClient` keeps one circuit per origin in the shared `CircuitStateStorageInterface` (Redis, with `waffle-commons/data`). An open circuit fails fast with `Exception\CircuitOpenException` (`503`, never retried), and every transition is published as a `CircuitStateChanged` event and as metrics. Compose them as `RetryingClient(CircuitBreakerClient(Client))`, so every attempt is checked and re-runs the SSRF guard.
+- **Settled fan-out.** `Client::settleRequests()` (`SettlingClientInterface`) maps every request of a batch to its response or to the exception its transfer failed with, and throws nothing. Both decorators cover this concurrent path.
+- **Breaking:** an unresolvable host is now a `NetworkException` (cURL code 6), no longer an `SsrfException`, so the retry policy retries it and the breaker counts it.
+- **Fixed:** one framing per request body (RFC 9112 §6.1): the caller's `Content-Length` no longer goes out next to `Transfer-Encoding: chunked`, which nginx refused with `400`. Transport failures are `NetworkException`s again on every path; since `0.1.0-beta5` they read as `RequestException`.
+
+How-to: [Make outbound calls resilient](https://github.com/waffle-commons/documentation/blob/main/how-to/make-outbound-calls-resilient.md).
 
 ## 🆕 Beta-1 foundations (still current)
 
 - **Persistent socket reuse.** A single `\CurlHandle` and a single `\CurlMultiHandle` live for the worker's lifetime; `curl_reset()` between requests keeps the connection pool, DNS cache, and TLS session cache warm. Source: `Client.php` (`// Holds a single persistent CurlHandle plus a CurlMultiHandle that are reused via curl_reset() ...`).
 - **Non-blocking transfer.** The transfer runs through the persistent `\CurlMultiHandle` (`curl_multi_exec` + `curl_multi_select`) rather than the blocking `curl_exec()`. The worker never busy-spins, and a slow legacy backend can no longer pin it on a blocking syscall beyond the hard timeout ceiling. The multi handle is also the building block for future concurrent fan-out.
-- **Bidirectional bounded streaming (8 KiB chunks).** Request bodies are streamed via `CURLOPT_READFUNCTION` + `CURLOPT_UPLOAD` (pulling `CHUNK_SIZE = 8 * 1024` bytes at a time from the PSR-7 request stream) instead of buffering the whole payload with `CURLOPT_POSTFIELDS`. Known lengths are advertised with `CURLOPT_INFILESIZE`; unknown lengths fall back to `Transfer-Encoding: chunked`. Response bodies stream via `CURLOPT_WRITEFUNCTION`. A multi-gigabyte multipart upload is proxied without a RAM spike.
+- **Bidirectional bounded streaming (8 KiB chunks).** Request bodies are streamed via `CURLOPT_READFUNCTION` + `CURLOPT_UPLOAD` (pulling `CHUNK_SIZE = 8 * 1024` bytes at a time from the PSR-7 request stream) instead of buffering the whole payload with `CURLOPT_POSTFIELDS`. The length is the stream's size, else the request's single well-formed `Content-Length`; only an unknown length goes out `Transfer-Encoding: chunked`, and libcurl writes the framing (Beta-7, RFC 9112 §6.1). Response bodies stream via `CURLOPT_WRITEFUNCTION`. A multi-gigabyte multipart upload is proxied without a RAM spike.
 - **SEC-03 SSRF allowlist.** `Client::applyRequest()` sets both `CURLOPT_PROTOCOLS` and `CURLOPT_REDIR_PROTOCOLS` to `CURLPROTO_HTTP | CURLPROTO_HTTPS` (verbatim, `Client.php:178-179`), blocking SSRF pivots via `file://`, `gopher://`, `dict://`, `ldap://`, etc. — even when a caller-supplied URL or a server-supplied `Location` header tries to switch protocols mid-flight.
 
 ## 📦 Installation
@@ -38,7 +45,10 @@ You also need PSR-17 factory implementations for `ResponseFactoryInterface` and 
 
 | Class | Role |
 | :--- | :--- |
-| `Waffle\Commons\HttpClient\Client` | `final readonly` PSR-18 client. Persistent cURL easy + multi handles, non-blocking transfer, hardcoded 1s connect / 10s total timeouts, request **and** response bodies streamed in 8 KiB chunks. |
+| `Waffle\Commons\HttpClient\Client` | `final readonly` PSR-18 client. Persistent cURL easy + multi handles, non-blocking transfer, 1 s connect / 10 s total timeouts by default (per request through `withTimeouts(TimeoutPolicy)`), request **and** response bodies streamed in 8 KiB chunks. |
+| `Waffle\Commons\HttpClient\Resilience\RetryingClient` | Bounded retries with backoff and jitter around any PSR-18 client, single and settled batches (*Beta-7*, NET-02). |
+| `Waffle\Commons\HttpClient\Resilience\CircuitBreakerClient` | Per-origin circuit breaker over the shared `CircuitStateStorageInterface` (*Beta-7*, NET-03). |
+| `Waffle\Commons\HttpClient\Exception\CircuitOpenException` | Thrown, or settled, while a circuit is open: `503`, never retried. |
 | `Waffle\Commons\HttpClient\Exception\HttpClientException` | Base class for client errors (e.g. handle init failure). Implements `Psr\Http\Client\ClientExceptionInterface`. |
 | `Waffle\Commons\HttpClient\Exception\NetworkException` | Transport-layer failures (DNS, connect/read timeout, TLS, reset). Implements `Psr\Http\Client\NetworkExceptionInterface`. |
 | `Waffle\Commons\HttpClient\Exception\RequestException` | Protocol-level failures or empty responses. Implements `Psr\Http\Client\RequestExceptionInterface`. |
@@ -111,6 +121,7 @@ The test suite uses `php-mock/php-mock-phpunit` to stub libcurl entry points (`c
 Full guides live in the central Diátaxis documentation tree:
 
 - [Reference — `waffle-commons/http-client`](https://github.com/waffle-commons/documentation/blob/main/reference/http-client.md)
+- [How-to — Make outbound calls resilient](https://github.com/waffle-commons/documentation/blob/main/how-to/make-outbound-calls-resilient.md)
 - [Documentation home](https://github.com/waffle-commons/documentation)
 
 ## 📄 License
