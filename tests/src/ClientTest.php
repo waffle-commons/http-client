@@ -211,6 +211,27 @@ final class ClientTest extends AbstractTestCase
         self::assertSame('', $read($handle, null, Client::CHUNK_SIZE));
     }
 
+    public function testABodyAlreadyReadToItsEndIsUploadedFromItsStart(): void
+    {
+        $payload = '{"order":42}';
+        $this->primeSuccessfulExchange(["HTTP/1.1 201 Created\r\n", "\r\n"], []);
+        $this->mockCurlSetoptCapturingOption();
+
+        // A retry hands the transport the same stream its first attempt read to the end, and a request
+        // factory may have read it already to parse it. A seekable body goes out from its first byte.
+        $body = $this->psr17->createStream($payload);
+        $body->getContents();
+        self::assertSame(strlen($payload), $body->tell());
+
+        $this->dispatch($this->psr17->createRequest('PUT', 'https://example.com/orders/42')->withBody($body));
+
+        $read = $this->capturedScalarOptions[CURLOPT_READFUNCTION] ?? null;
+        self::assertInstanceOf(Closure::class, $read);
+        $handle = $this->capturedHandle;
+        self::assertInstanceOf(CurlHandle::class, $handle);
+        self::assertSame($payload, $read($handle, null, Client::CHUNK_SIZE));
+    }
+
     public function testRequestBodyWithUnknownLengthUsesChunkedUpload(): void
     {
         $this->primeSuccessfulExchange(["HTTP/1.1 200 OK\r\n", "\r\n"], []);
@@ -229,6 +250,34 @@ final class ClientTest extends AbstractTestCase
         self::assertTrue($this->capturedScalarOptions[CURLOPT_UPLOAD] ?? null);
         self::assertArrayNotHasKey(CURLOPT_INFILESIZE, $this->capturedScalarOptions);
         self::assertArrayNotHasKey(CURLOPT_POSTFIELDS, $this->capturedScalarOptions);
+    }
+
+    public function testAnUnsizedBodyGoesOutWithItsDeclaredLengthAndOneFraming(): void
+    {
+        $this->primeSuccessfulExchange(["HTTP/1.1 201 Created\r\n", "\r\n"], []);
+        $this->mockCurlSetoptCapturingOption();
+
+        // php://input in a FrankenPHP worker: no size of its own, a Content-Length from the client that
+        // sent it. Chunking it while that header went out too made nginx answer 400 (EcoShield, GATE-02).
+        $stream = $this->createStub(StreamInterface::class);
+        $stream->method('getSize')->willReturn(null);
+        $stream->method('isSeekable')->willReturn(false);
+
+        $request = $this->psr17
+            ->createRequest('POST', 'https://example.com/orders')
+            ->withHeader('Content-Length', '11')
+            ->withHeader('Content-Type', 'application/json')
+            ->withBody($stream);
+        $this->dispatch($request);
+
+        self::assertTrue($this->capturedScalarOptions[CURLOPT_UPLOAD] ?? null);
+        self::assertSame(11, $this->capturedScalarOptions[CURLOPT_INFILESIZE] ?? null);
+
+        /** @var list<string> $sent */
+        $sent = $this->capturedOptions[CURLOPT_HTTPHEADER];
+        self::assertContains('Content-Type: application/json', $sent);
+        // libcurl writes the one Content-Length itself, from CURLOPT_INFILESIZE.
+        self::assertSame([], preg_grep('/^(content-length|transfer-encoding):/i', $sent));
     }
 
     public function testEmptyRequestBodyDoesNotStream(): void
@@ -533,5 +582,22 @@ final class ClientTest extends AbstractTestCase
                 $this->capturedScalarOptions[$option] = $value;
                 return true;
             });
+    }
+
+    public function testWithTimeoutsBoundsTheConnectOnACopy(): void
+    {
+        $client = new Client($this->psr17, $this->psr17);
+        $fast = $client->withTimeouts(new \Waffle\Commons\Contracts\HttpClient\TimeoutPolicy(200, 1000));
+        static::assertNotSame($client, $fast);
+
+        $started = hrtime(true);
+        try {
+            // A non-routable address: the transfer ends by the connect timeout or by whatever the local
+            // network stack answers (Docker Desktop intercepts it), never after the 1 s total.
+            $fast->sendRequest($this->psr17->createRequest('GET', 'http://10.255.255.1:81/'));
+            static::fail('The transfer must not succeed.');
+        } catch (\Psr\Http\Client\ClientExceptionInterface) {
+            static::assertLessThan(2.0, (hrtime(true) - $started) / 1_000_000_000);
+        }
     }
 }

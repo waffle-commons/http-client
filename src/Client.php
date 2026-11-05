@@ -6,6 +6,8 @@ namespace Waffle\Commons\HttpClient;
 
 use CurlHandle;
 use CurlMultiHandle;
+use IgorPhp\IgorBundle\Attribute\WorkerSafe;
+use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseFactoryInterface;
@@ -15,6 +17,8 @@ use Psr\Http\Message\StreamInterface;
 use Throwable;
 use Waffle\Commons\Contracts\HttpClient\ConcurrentClientInterface;
 use Waffle\Commons\Contracts\HttpClient\PromiseInterface;
+use Waffle\Commons\Contracts\HttpClient\SettlingClientInterface;
+use Waffle\Commons\Contracts\HttpClient\TimeoutPolicy;
 use Waffle\Commons\Contracts\Telemetry\Enum\SpanKind;
 use Waffle\Commons\Contracts\Telemetry\Enum\SpanStatus;
 use Waffle\Commons\Contracts\Telemetry\NullTextMapPropagator;
@@ -47,6 +51,8 @@ use Waffle\Commons\HttpClient\Security\SsrfGuard;
  * handle and drives one shared `curl_multi_exec()` loop, so N requests complete
  * in roughly the wall-clock of the slowest one. {@see self::promise()} hands the
  * caller a non-blocking {@see PromiseInterface} over a single in-flight request.
+ * {@see self::settleRequests()} runs the same fan-out but settles every request
+ * instead of throwing the first failure, which the resilience decorators build on.
  * Per-request handles are created and closed within the call — the only resident
  * state is the persistent easy/multi handle, so the client stays worker-safe.
  *
@@ -62,15 +68,22 @@ use Waffle\Commons\HttpClient\Security\SsrfGuard;
  * and the vetted IP is pinned via `CURLOPT_RESOLVE` before the transfer — the
  * transport can never connect to an internal address, even under DNS rebinding.
  *
- * Connect and total timeouts are hardcoded ceilings (1s / 10s) and cannot be
- * raised by callers — a hung legacy backend must never lock a worker thread.
+ * Connect and total timeouts come from a {@see TimeoutPolicy} — 1 s / 10 s unless
+ * {@see self::withTimeouts()} returns a copy with another one ([NET-02]). The policy
+ * cannot express an infinite timeout, so a hung legacy backend never locks a worker thread.
  */
-final readonly class Client implements ClientInterface, ConcurrentClientInterface
+final readonly class Client implements ClientInterface, ConcurrentClientInterface, SettlingClientInterface
 {
-    /** Maximum time to establish a TCP/TLS connection (ms). */
+    /**
+     * The former connect ceiling (ms). The client no longer reads it: {@see TimeoutPolicy::DEFAULT_CONNECT_MS}
+     * replaced it in 0.1.0-beta7; a candidate for the beta8 deprecation pass.
+     */
     public const int CONNECT_TIMEOUT_MS = 1000;
 
-    /** Maximum total time for a single request, including transfer (ms). */
+    /**
+     * The former total ceiling (ms). The client no longer reads it: {@see TimeoutPolicy::DEFAULT_TOTAL_MS}
+     * replaced it in 0.1.0-beta7; a candidate for the beta8 deprecation pass.
+     */
     public const int TIMEOUT_MS = 10_000;
 
     /** Body streaming chunk size (bytes), used for both upload and download. */
@@ -87,6 +100,8 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
     private const int SELECT_BACKOFF_US = 100;
 
     private CurlHandle $handle;
+
+    private TimeoutPolicy $timeouts;
 
     private CurlMultiHandle $multiHandle;
 
@@ -105,8 +120,19 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             throw new HttpClientException('Failed to initialise the underlying cURL handle.');
         }
         $this->handle = $handle;
+        $this->timeouts = new TimeoutPolicy();
         // curl_multi_init() never fails (returns a CurlMultiHandle), so no guard.
         $this->multiHandle = curl_multi_init();
+    }
+
+    /**
+     * A copy using other timeouts ([NET-02], RFC-024 §3.1): the per-request override is an immutable
+     * wither, never mutable client state. The defaults are the former hard ceilings, and the policy
+     * cannot express an infinite timeout.
+     */
+    public function withTimeouts(TimeoutPolicy $timeouts): self
+    {
+        return clone($this, ['timeouts' => $timeouts]);
     }
 
     /**
@@ -114,6 +140,9 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
      * outbound request, so a distributed trace continues across the service boundary.
      */
     #[\Override]
+    #[WorkerSafe(
+        reason: 'per-call span from the injected tracer, ended in finally; attributes and status go to that span only, nothing survives the call',
+    )]
     public function sendRequest(RequestInterface $request): ResponseInterface
     {
         $span = $this->tracer->startSpan('http.client.request', SpanKind::Client);
@@ -196,6 +225,59 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             // In PHP 8.x a CurlHandle is a GC-managed object (curl_close is a
             // deprecated no-op), so dropping the last reference releases it — no
             // per-request state survives the call.
+            foreach ($transfers as $transfer) {
+                curl_multi_remove_handle($multiHandle, $transfer->handle);
+            }
+            curl_multi_close($multiHandle);
+        }
+    }
+
+    /**
+     * Resolve several requests concurrently, like {@see self::sendRequests()},
+     * but settle each one: every key maps to its response or to the exception its
+     * transfer failed with, and nothing is thrown ([NET-02], RFC-024 §3.3). A
+     * request the SSRF guard refuses settles as its {@see \Waffle\Commons\HttpClient\Exception\SsrfException}
+     * and is never sent, while the rest of the batch runs.
+     *
+     * @param array<array-key, RequestInterface> $requests
+     *
+     * @return array<array-key, ResponseInterface|ClientExceptionInterface>
+     */
+    #[\Override]
+    public function settleRequests(array $requests): array
+    {
+        // An empty batch drives an empty multi handle, which settles at once.
+        $multiHandle = curl_multi_init();
+
+        // One slot per request, in the batch's key order: its transfer, or the
+        // failure that kept it from being prepared.
+        /** @var array<array-key, Transfer|ClientExceptionInterface> $slots */
+        $slots = [];
+        /** @var list<Transfer> $transfers */
+        $transfers = [];
+        try {
+            foreach ($requests as $key => $request) {
+                try {
+                    $transfer = $this->prepareTransfer($this->injectTraceContext($request));
+                } catch (ClientExceptionInterface $refused) {
+                    $slots[$key] = $refused;
+                    continue;
+                }
+
+                curl_multi_add_handle($multiHandle, $transfer->handle);
+                $slots[$key] = $transfer;
+                $transfers[] = $transfer;
+            }
+
+            $status = $this->drive($multiHandle);
+
+            $outcomes = [];
+            foreach ($slots as $key => $slot) {
+                $outcomes[$key] = $slot instanceof Transfer ? $this->outcomeOf($slot, $status) : $slot;
+            }
+
+            return $outcomes;
+        } finally {
             foreach ($transfers as $transfer) {
                 curl_multi_remove_handle($multiHandle, $transfer->handle);
             }
@@ -358,6 +440,23 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
     }
 
     /**
+     * A driven transfer's response, or the failure it settled with: a broken
+     * multi loop fails every transfer of the batch (ASYNC02-01).
+     */
+    private function outcomeOf(Transfer $transfer, int $status): ResponseInterface|ClientExceptionInterface
+    {
+        if ($status !== CURLM_OK) {
+            return $this->mapMultiError($transfer->request, $status);
+        }
+
+        try {
+            return $this->finishTransfer($transfer);
+        } catch (ClientExceptionInterface $failure) {
+            return $failure;
+        }
+    }
+
+    /**
      * Drives the transfer through the persistent multi handle, parking on
      * `curl_multi_select()` between ticks so the worker never busy-waits. The
      * easy handle is added and removed each call but the underlying connection
@@ -413,6 +512,19 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             }
         } while ($running > 0 && $status === CURLM_OK);
 
+        // PHP copies a finished transfer's CURLcode into its easy handle only when
+        // the handle's completion message is read. Without this drain, curl_errno()
+        // answers 0 for a failed transfer, and a dead upstream reads as "no status
+        // line" (a RequestException) instead of the NetworkException that the
+        // retry policy retries and the circuit breaker counts. The count of messages
+        // still queued comes back through a by-ref out-parameter the stubs leave
+        // untyped: it stays in an array slot and is cast in place (an int, or null
+        // when the queue was already empty).
+        $queued = [0];
+        do {
+            curl_multi_info_read($multiHandle, $queued[0]);
+        } while ((int) $queued[0] > 0);
+
         return $status;
     }
 
@@ -428,13 +540,16 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
         string &$statusLine,
         array &$headers,
     ): void {
+        // One framing for the whole message: the length below decides both the upload and the headers.
+        $length = RequestFraming::bodyLength($request);
+
         $options = [
             CURLOPT_URL => (string) $request->getUri(),
             CURLOPT_CUSTOMREQUEST => $request->getMethod(),
             CURLOPT_HTTP_VERSION => $this->resolveHttpVersion($request->getProtocolVersion()),
-            CURLOPT_HTTPHEADER => $this->buildHeaderLines($request),
-            CURLOPT_CONNECTTIMEOUT_MS => self::CONNECT_TIMEOUT_MS,
-            CURLOPT_TIMEOUT_MS => self::TIMEOUT_MS,
+            CURLOPT_HTTPHEADER => RequestFraming::headerLines($request, $length),
+            CURLOPT_CONNECTTIMEOUT_MS => $this->timeouts->connectMs,
+            CURLOPT_TIMEOUT_MS => $this->timeouts->totalMs,
             CURLOPT_NOSIGNAL => true,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
@@ -467,7 +582,7 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
 
         curl_setopt_array($handle, $options);
 
-        $this->applyRequestBody($handle, $request);
+        $this->applyRequestBody($handle, $request, $length);
     }
 
     /**
@@ -480,20 +595,18 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
      * `CURLOPT_CUSTOMREQUEST` is preserved; `CURLOPT_UPLOAD` only switches on the
      * read-callback transfer mode, it does not override the method line.
      *
-     * When the body length is known it is advertised via `CURLOPT_INFILESIZE`
-     * (Content-Length); when it is not (`getSize() === null`), libcurl falls back
-     * to `Transfer-Encoding: chunked`.
+     * When the body length is known ({@see RequestFraming::bodyLength()}) it is advertised
+     * via `CURLOPT_INFILESIZE` (Content-Length); when it is not, libcurl falls back to
+     * `Transfer-Encoding: chunked`.
      */
-    private function applyRequestBody(CurlHandle $handle, RequestInterface $request): void
+    private function applyRequestBody(CurlHandle $handle, RequestInterface $request, ?int $length): void
     {
-        $stream = $request->getBody();
-        $size = $stream->getSize();
-
         // No body to forward (typical GET/DELETE/HEAD): leave the handle as-is.
-        if ($size === 0) {
+        if ($length === 0) {
             return;
         }
 
+        $stream = $request->getBody();
         if ($stream->isSeekable()) {
             $stream->rewind();
         }
@@ -513,8 +626,8 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
             },
         );
 
-        if ($size !== null) {
-            curl_setopt($handle, CURLOPT_INFILESIZE, $size);
+        if ($length !== null) {
+            curl_setopt($handle, CURLOPT_INFILESIZE, $length);
         }
     }
 
@@ -584,20 +697,6 @@ final readonly class Client implements ClientInterface, ConcurrentClientInterfac
         $reason = $parts[2] ?? '';
 
         return [$version, $code, $reason];
-    }
-
-    /**
-     * @return list<string>
-     */
-    private function buildHeaderLines(RequestInterface $request): array
-    {
-        $lines = [];
-        foreach ($request->getHeaders() as $name => $values) {
-            foreach ($values as $value) {
-                $lines[] = $name . ': ' . $value;
-            }
-        }
-        return $lines;
     }
 
     private function resolveHttpVersion(string $protocolVersion): int

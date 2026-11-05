@@ -10,9 +10,10 @@ use Waffle\Commons\Contracts\HttpClient\Exception\RequestExceptionInterface;
 
 /**
  * Raised when the SSRF guard refuses an outbound request because the target
- * host is missing, unresolvable, or resolves to a non-public IP address
- * (SEC-02). A PSR-18 request exception — `getRequest()` returns the offending
- * request — so callers catch it through the standard client-exception surface.
+ * host is missing or resolves to a non-public IP address (SEC-02). A host that
+ * does not resolve at all is a {@see NetworkException}, as cURL reports it. A
+ * PSR-18 request exception — `getRequest()` returns the offending request — so
+ * callers catch it through the standard client-exception surface.
  */
 final class SsrfException extends HttpClientException implements RequestExceptionInterface
 {

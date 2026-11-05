@@ -227,6 +227,92 @@ final class ClientConcurrencyTest extends ConcurrencyTestCase
         self::assertCount(1, $this->recorder->optionsByHandle);
     }
 
+    public function testSettleRequestsOfAnEmptyBatchIsEmpty(): void
+    {
+        $this->primeMultiTransfer();
+
+        self::assertSame([], new Client($this->psr17, $this->psr17)->settleRequests([]));
+    }
+
+    public function testSettleRequestsSettlesEveryRequestWithoutThrowing(): void
+    {
+        $this->primeMultiTransfer();
+        $this->queueResponse(["HTTP/1.1 200 OK\r\n", "\r\n"], ['first']);
+        $this->queueResponse([], [], CURLE_OPERATION_TIMEOUTED, 'Operation timed out');
+        $this->queueResponse([], []);
+        $this->queueResponse(["HTTP/1.1 201 Created\r\n", "\r\n"], ['last']);
+        $requests = [
+            'ok' => $this->psr17->createRequest('GET', 'https://a.example.com/'),
+            'slow' => $this->psr17->createRequest('GET', 'https://b.example.com/'),
+            'mute' => $this->psr17->createRequest('GET', 'https://c.example.com/'),
+            9 => $this->psr17->createRequest('GET', 'https://d.example.com/'),
+        ];
+
+        $outcomes = new Client($this->psr17, $this->psr17)->settleRequests($requests);
+
+        // Every request settles, in the batch's key order: a failure no longer hides the others.
+        self::assertSame(['ok', 'slow', 'mute', 9], array_keys($outcomes));
+        $ok = $outcomes['ok'] ?? null;
+        self::assertInstanceOf(ResponseInterface::class, $ok);
+        self::assertSame('first', (string) $ok->getBody());
+        $slow = $outcomes['slow'] ?? null;
+        self::assertInstanceOf(NetworkException::class, $slow);
+        self::assertSame($requests['slow'], $slow->getRequest());
+        self::assertSame(CURLE_OPERATION_TIMEOUTED, $slow->getCode());
+        $mute = $outcomes['mute'] ?? null;
+        self::assertInstanceOf(RequestException::class, $mute);
+        self::assertStringContainsString('No HTTP status line', $mute->getMessage());
+        $last = $outcomes[9] ?? null;
+        self::assertInstanceOf(ResponseInterface::class, $last);
+        self::assertSame(201, $last->getStatusCode());
+        // Every per-request handle is detached and the multi handle closed.
+        self::assertSame(4, $this->recorder->multiRemoveCalls);
+        self::assertSame(1, $this->recorder->multiCloseCalls);
+    }
+
+    public function testSettleRequestsNeverSendsWhatTheSsrfGuardRefusesButSendsTheRest(): void
+    {
+        $this->primeMultiTransfer();
+        $this->queueResponse(["HTTP/1.1 200 OK\r\n", "\r\n"], ['public']);
+        $guard = new SsrfGuard(new class implements HostResolverInterface {
+            #[\Override]
+            public function resolve(string $host): array
+            {
+                return [$host === 'internal.example.com' ? '127.0.0.1' : '93.184.216.34'];
+            }
+        });
+
+        $outcomes = new Client($this->psr17, $this->psr17, $guard)->settleRequests([
+            'internal' => $this->psr17->createRequest('GET', 'https://internal.example.com/'),
+            'public' => $this->psr17->createRequest('GET', 'https://public.example.com/'),
+        ]);
+
+        self::assertInstanceOf(SsrfException::class, $outcomes['internal'] ?? null);
+        $public = $outcomes['public'] ?? null;
+        self::assertInstanceOf(ResponseInterface::class, $public);
+        self::assertSame('public', (string) $public->getBody());
+        // Only the public request got a handle, pinned to its vetted address.
+        self::assertSame([['public.example.com:443:93.184.216.34']], $this->capturedResolvePins());
+    }
+
+    public function testSettleRequestsFailsEveryTransferOfABrokenMultiLoop(): void
+    {
+        $this->primeMultiTransfer(CURLM_INTERNAL_ERROR);
+        $requests = [
+            $this->psr17->createRequest('GET', 'https://a.example.com/'),
+            $this->psr17->createRequest('GET', 'https://b.example.com/'),
+        ];
+
+        $outcomes = new Client($this->psr17, $this->psr17)->settleRequests($requests);
+
+        foreach ($requests as $key => $request) {
+            $outcome = $outcomes[$key] ?? null;
+            self::assertInstanceOf(NetworkException::class, $outcome);
+            self::assertSame($request, $outcome->getRequest());
+            self::assertSame(CURLE_RECV_ERROR, $outcome->getCode());
+        }
+    }
+
     public function testPromiseResolvesFulfilled(): void
     {
         $this->primeMultiTransfer();

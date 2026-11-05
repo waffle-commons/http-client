@@ -5,6 +5,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Released in lockstep with the Waffle Commons umbrella tag.
 
+## [0.1.0-beta7] — 2026-11
+
+**Theme: outbound resilience — bounded timeouts, retries and a circuit breaker; one framing per request body.**
+
+### Added
+- **Outbound resilience (NET-02, NET-03, RFC-024).** `Client::withTimeouts(TimeoutPolicy)` — per-request timeouts as an immutable wither (defaults = the former ceilings; no infinite timeout can be expressed). `Resilience\RetryingClient` — bounded retries around any PSR-18 client: transport failures and 429/502/503/504, idempotent methods only unless opted in, exponential backoff with full jitter, numeric `Retry-After` honoured beyond the cap within the total budget. `Resilience\CircuitBreakerClient` — a breaker keyed by origin over the shared `CircuitStateStorageInterface`: an open circuit fails fast with `Exception\CircuitOpenException` (503, never retried), transport failures and 5xx count as failures, transitions are published as `CircuitStateChanged` events and metrics (`waffle_circuit_transitions_total`, `waffle_circuit_state`), and an unavailable storage behaves as closed with a warning and `waffle_circuit_storage_errors_total`. Compose as `RetryingClient(CircuitBreakerClient(Client))` so every attempt is checked and re-runs the SSRF guard.
+- `Client::settleRequests()`, the contracts' `HttpClient\SettlingClientInterface` — the concurrent fan-out, settled: every request of the batch maps to its response or to the exception its transfer failed with, in the batch's key order, and nothing is thrown. A request the SSRF guard refuses settles as its `SsrfException` and is never sent, while the rest of the batch runs; a broken multi loop fails every transfer. It is the building block for the resilience decorators' concurrent path (RFC-024 §3.3), which needs every request's outcome; `sendRequests()` keeps its fail-fast behaviour.
+- **The resilience decorators cover the concurrent path (RFC-024 §3.3).** `RetryingClient` and `CircuitBreakerClient` implement `SettlingClientInterface`. The breaker asks the shared storage about every request of a batch before any is sent, sends the admitted ones together and records each outcome; a refused request settles as its `CircuitOpenException` and is never sent. The retry policy retries a batch in waves: each request keeps its own attempts, backoff, `Retry-After` and budget, and the requests to retry go out together once the longest of their waits has passed. `sendRequests()` is the fail-fast view of the settled batch (the first failure in key order, thrown once every outcome is recorded), and `promise()` runs the decorator's whole `sendRequest()` when it is waited on. `Resilience\Settlement` holds the shared steps: an inner client that does not settle is sent one request at a time, a batch of one goes through `sendRequest()` to keep the persistent connection warm, and a request a settling client returns no outcome for settles as a `RequestException`.
+
+### Changed
+- **An unresolvable host is a `NetworkException` (cURL code 6), no longer an `SsrfException`.** The SSRF guard resolves every host it vets, so a DNS outage of a public upstream surfaced as a refusal: the retry policy did not retry it and the circuit breaker did not count it, while the same outage of an allow-listed host (resolved by cURL) did both. Nothing is sent either way; `SsrfException` keeps the refusals (no host, a non-public address).
+
+### Fixed
+- **One framing per request body (RFC 9112 §6.1).** A body whose stream cannot report its size — `php://input` in a FrankenPHP worker — went out `Transfer-Encoding: chunked` while the caller's own `Content-Length` went out too: two framings in one request, the shape request smuggling relies on, which nginx refuses with 400. Through the EcoShield gateway every proxied POST and PUT failed this way, on beta6 as on beta7 (`[GATE-02]`). The body length is now the stream's size, else the request's single well-formed `Content-Length`, else unknown (chunked); when the client uploads the body, libcurl writes the framing and the caller's `Content-Length` and `Transfer-Encoding` are left out. A request that sends no body keeps its headers. The rules live in the internal `RequestFraming`; a test fails against the previous client.
+- **Transport failures are `NetworkException`s again, on every path.** PHP copies a multi-driven handle's cURL result into the handle only when its completion message is read, and since 0.1.0-beta5 the client never read it: `curl_errno()` answered 0, so a DNS failure, a refused connection, a timeout or a TLS failure surfaced as `RequestException` "No HTTP status line received". The retry policy never retried them and the circuit breaker never counted them. The drive loop now drains the completion messages; a test drives the real transport to a refused port on the single, batch and promise paths.
+
+### Dependencies
+- `psr/log` is a direct requirement.
+
 ## [0.1.0-beta6] — 2026-09
 
 **Theme: documentation.**
