@@ -21,7 +21,7 @@
     ],
     "minimum-stability": "stable",
     "require": {
-        "php": "^8.5",
+        "php": "^8.5.12",
         "ext-curl": "*",
         "psr/http-client": "^1.0",
         "psr/http-factory": "^1.0",
